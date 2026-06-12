@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -222,7 +222,7 @@ def cred_status(creds: OauthCreds, now: float) -> str | None:
 # ----------------------------------------------------------- usage probe ---
 
 
-@dataclass
+@dataclass(frozen=True)
 class Usage:
     five: float  # 5h window utilization %
     seven: float  # 7d window utilization %
@@ -271,22 +271,6 @@ def fetch_usage(token: str):
     )
 
 
-def cache_get(cfg: Config, name: str, now: float) -> Usage | None:
-    entry = read_json(cfg.cache / name)
-    try:
-        if now - entry["epoch"] < USAGE_TTL:
-            return Usage(
-                entry["five"],
-                entry["seven"],
-                entry["r5"],
-                entry["r7"],
-                asof=float(entry["epoch"]),
-            )
-    except (KeyError, TypeError):
-        pass
-    return None
-
-
 def last_known(cfg: Config, name: str) -> Usage | None:
     """The most recent successful probe regardless of age — the fallback
     when the endpoint is rate-limiting. asof carries its timestamp."""
@@ -299,24 +283,29 @@ def last_known(cfg: Config, name: str) -> Usage | None:
             entry["r7"],
             asof=float(entry["epoch"]),
         )
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, ValueError):
         return None
 
 
-def cache_put(cfg: Config, name: str, usage: Usage, now: float) -> None:
+def cache_get(cfg: Config, name: str, now: float) -> Usage | None:
+    """last_known, but only while it is still within the probe TTL."""
+    u = last_known(cfg, name)
+    return u if u is not None and now - u.asof < USAGE_TTL else None
+
+
+def cache_put(cfg: Config, name: str, usage: Usage) -> None:
     try:
         cfg.cache.mkdir(parents=True, exist_ok=True)
-        (cfg.cache / name).write_text(
-            json.dumps(
-                {
-                    "epoch": now,
-                    "five": usage.five,
-                    "seven": usage.seven,
-                    "r5": usage.r5,
-                    "r7": usage.r7,
-                }
-            )
+        data = json.dumps(
+            {
+                "epoch": usage.asof,
+                "five": usage.five,
+                "seven": usage.seven,
+                "r5": usage.r5,
+                "r7": usage.r7,
+            }
         )
+        atomic_write(cfg.cache / name, data.encode(), mode=0o644)
     except OSError:
         pass
 
@@ -376,8 +365,8 @@ def probe(account: Account, cfg: Config, now: float, fetcher=None):
     else:
         result = fetcher(creds.token)
     if isinstance(result, Usage):
-        result.asof = now
-        cache_put(cfg, account.name, result, now)
+        result = replace(result, asof=now)
+        cache_put(cfg, account.name, result)
         record_history(cfg, account.name, result, now)
         try:
             cooldown.unlink()
