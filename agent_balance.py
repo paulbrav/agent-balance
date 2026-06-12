@@ -519,11 +519,22 @@ def read_state(cfg: Config, now: float) -> dict:
         sha = ""
     if not isinstance(epoch, (int, float)) or epoch < 0:
         epoch = 0
-    return {
+    result: dict = {
         "installed": installed,
         "blob_sha256": sha,
         "last_swap_epoch": min(int(epoch), int(now)),
     }
+    pending = state.get("pending")  # in-flight swap journal (see tick)
+    if (
+        isinstance(pending, dict)
+        and isinstance(pending.get("target"), str)
+        and isinstance(pending.get("src_sha"), str)
+    ):
+        result["pending"] = {
+            "target": pending["target"],
+            "src_sha": pending["src_sha"],
+        }
+    return result
 
 
 def write_state(cfg: Config, state: dict) -> None:
@@ -547,19 +558,22 @@ def log_swap(cfg: Config, now: float, line: str) -> None:
 # ------------------------------------------------- pool install / harvest ---
 
 
-def install_creds(cfg: Config, account: Account, out=print) -> str:
-    """Copy the account's credentials into the pool and stamp its identity
-    into the pool's .claude.json (cosmetic — keeps /status honest)."""
-    sha = copy_creds(account.creds, cfg.pool / ".credentials.json")
+def install_creds(cfg: Config, account: Account) -> str:
+    """Copy the account's credentials into the pool, stamping its identity
+    into the pool's .claude.json FIRST: a crash between the two writes must
+    leave the meta naming the incoming account, never the outgoing one —
+    harvest's identity pass keys off that email, and a stale email would
+    make it sync the new account's token into the old account's home."""
+    cfg.pool.mkdir(parents=True, exist_ok=True)
     oauth_account = read_json(meta_path(account.home)).get("oauthAccount")
     pool_meta_path = cfg.pool / ".claude.json"
+    pool_meta = read_json(pool_meta_path)
     if oauth_account:
-        pool_meta = read_json(pool_meta_path)
         pool_meta["oauthAccount"] = oauth_account
-        atomic_write(
-            pool_meta_path, json.dumps(pool_meta, indent=2).encode(), mode=0o644
-        )
-    return sha
+    else:
+        pool_meta.pop("oauthAccount", None)  # never keep the previous identity
+    atomic_write(pool_meta_path, json.dumps(pool_meta, indent=2).encode(), mode=0o644)
+    return copy_creds(account.creds, cfg.pool / ".credentials.json")
 
 
 def bootstrap_pool(cfg: Config, source: Account, out=print) -> None:
@@ -589,7 +603,10 @@ def harvest(
     cfg: Config, accounts: list[Account], state: dict, now: float, out=print
 ) -> dict:
     """Reconcile the pool with the canonical account dirs before deciding
-    anything. Two passes:
+    anything. A pending-swap journal entry (a tick died mid-swap) is
+    settled first and ends the pass — the email heuristic and the
+    freshness sync must never run against a half-applied swap. Then two
+    passes:
 
     1. Identify: a pool blob whose hash differs from the recorded one was
        written by someone else — Claude Code refreshing the token, or a
@@ -603,6 +620,30 @@ def harvest(
        account was used directly."""
     pool_creds = cfg.pool / ".credentials.json"
     if not pool_creds.is_file():
+        return state
+
+    pending = state.pop("pending", None)
+    if pending is not None:
+        pool_sha = sha256_file(pool_creds)
+        if pool_sha == pending["src_sha"]:
+            # The journaled copy landed before the crash: finish the commit.
+            state.update(
+                installed=pending["target"],
+                blob_sha256=pool_sha,
+                last_swap_epoch=int(now),
+            )
+            out(f"agent-balance: finished interrupted swap to {pending['target']}")
+        elif pool_sha != state["blob_sha256"]:
+            # Neither the old blob nor the journaled one — someone else
+            # wrote the pool during the crash window. Identity is
+            # ambiguous; never copy anything home from here.
+            state.update(installed="unknown", blob_sha256=pool_sha)
+            out(
+                "agent-balance: pool changed during an interrupted swap; "
+                "credentials will be replaced on the next swap"
+            )
+        # else: the swap never started writing — the journal is just stale.
+        write_state(cfg, state)
         return state
 
     pool_sha = sha256_file(pool_creds)
@@ -837,10 +878,19 @@ def tick(
             )
             return 0
 
+        # Journal the swap before touching the pool: if we die between the
+        # pool writes and the final state write, the next tick's harvest
+        # settles the journal instead of misreading the half-applied pool.
+        state["pending"] = {
+            "target": target.name,
+            "src_sha": sha256_file(target.creds),
+        }
+        write_state(cfg, state)
         if not cfg.pool.is_dir():
             bootstrap_pool(cfg, target, out)
-        sha = install_creds(cfg, target, out)
+        sha = install_creds(cfg, target)
         prev = state["installed"]
+        del state["pending"]
         state.update(installed=target.name, blob_sha256=sha, last_swap_epoch=int(now))
         write_state(cfg, state)
         log_swap(cfg, now, f"SWAP {prev} {target.name} {five_now:.0f} {reason}")
