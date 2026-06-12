@@ -29,8 +29,7 @@ def real_logged_in_accounts():
     now = time.time()
     fresh = []
     for a in ab.discover_accounts(cfg):
-        oauth = ab.read_json(a.creds).get("claudeAiOauth") or {}
-        if (oauth.get("expiresAt") or 0) / 1000 > now + 600:
+        if ab.read_oauth(a.creds).expires_ms / 1000 > now + 600:
             fresh.append(a)
     return fresh
 

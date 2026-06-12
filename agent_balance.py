@@ -40,6 +40,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 VERSION = "0.3.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -190,6 +191,34 @@ def by_email(accounts: list[Account], email: str) -> Account | None:
     return next((a for a in accounts if a.email == email), None)
 
 
+class OauthCreds(NamedTuple):
+    token: str  # "" when missing/malformed
+    expires_ms: int  # 0 when missing/malformed
+
+
+def read_oauth(path: Path) -> OauthCreds:
+    """The claudeAiOauth shape of a credentials file — the only place that
+    knows it. Total: malformed fields coerce to falsy, never raise."""
+    oauth = read_json(path).get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
+    exp = oauth.get("expiresAt")
+    return OauthCreds(
+        token if isinstance(token, str) else "",
+        exp if isinstance(exp, int) else 0,
+    )
+
+
+def cred_status(creds: OauthCreds, now: float) -> str | None:
+    """'nologin' / 'expired' when the credentials can't be probed, None
+    when they look usable. A missing or malformed expiresAt counts as
+    expired (the field is milliseconds; the conversion lives only here)."""
+    if not creds.token:
+        return "nologin"
+    if creds.expires_ms / 1000 <= now:
+        return "expired"
+    return None
+
+
 # ----------------------------------------------------------- usage probe ---
 
 
@@ -320,12 +349,10 @@ def probe(account: Account, cfg: Config, now: float, fetcher=fetch_usage):
     limited | error. Cache-first; staggered real fetches; on a
     rate-limited endpoint, falls back to the last known numbers (asof
     marks their age) for up to STALE_MAX seconds."""
-    oauth = read_json(account.creds).get("claudeAiOauth") or {}
-    token = oauth.get("accessToken")
-    if not token:
-        return "nologin"
-    if (oauth.get("expiresAt") or 0) / 1000 <= now:
-        return "expired"
+    creds = read_oauth(account.creds)
+    word = cred_status(creds, now)
+    if word is not None:
+        return word
     cached = cache_get(cfg, account.name, now)
     if cached is not None:
         return cached
@@ -345,7 +372,7 @@ def probe(account: Account, cfg: Config, now: float, fetcher=fetch_usage):
 
     if fetcher is fetch_usage:  # throttle only the real network path
         throttle_fetch(cfg)
-    result = fetcher(token)
+    result = fetcher(creds.token)
     if isinstance(result, Usage):
         result.asof = now
         cache_put(cfg, account.name, result, now)
@@ -368,11 +395,9 @@ def offline_view(account: Account, cfg: Config, now: float):
     """Cache-only view for displays (the tray): Usage — possibly stale,
     asof says how stale — or a status word. Never touches the network;
     the balancer tick is the only steady fetcher on the machine."""
-    oauth = read_json(account.creds).get("claudeAiOauth") or {}
-    if not oauth.get("accessToken"):
-        return "nologin"
-    if (oauth.get("expiresAt") or 0) / 1000 <= now:
-        return "expired"
+    word = cred_status(read_oauth(account.creds), now)
+    if word is not None:
+        return word
     stale = last_known(cfg, account.name)
     return stale if stale is not None else "no data yet"
 
@@ -484,13 +509,6 @@ def sha256_file(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return ""
-
-
-def blob_expires(path: Path) -> int:
-    """expiresAt (ms) of a credentials file; 0 when unreadable."""
-    oauth = read_json(path).get("claudeAiOauth") or {}
-    exp = oauth.get("expiresAt")
-    return exp if isinstance(exp, int) else 0
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -671,8 +689,8 @@ def harvest(
 
     installed = by_name(accounts, state["installed"])
     if installed is not None:
-        pool_exp = blob_expires(pool_creds)
-        home_exp = blob_expires(installed.creds)
+        pool_exp = read_oauth(pool_creds).expires_ms
+        home_exp = read_oauth(installed.creds).expires_ms
         if pool_exp > home_exp:
             copy_creds(pool_creds, installed.creds)
             out(
