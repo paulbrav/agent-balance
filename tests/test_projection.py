@@ -2,8 +2,7 @@
 
 import dataclasses
 
-from conftest import NOW, add_account, make_fetcher, usage
-from test_tick import H2, HD, setup_installed
+from conftest import H2, HD, NOW, add_account, install_pool, make_fetcher, usage
 
 import agent_balance as ab
 
@@ -33,7 +32,7 @@ def test_fast_burn_swaps_below_threshold(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
     # ~4%/min burn observed; 95% now + 120s lookahead projects past 100%.
     write_history(cfg, "alt1", [(NOW - 600, 55), (NOW - 60, 91)])
 
@@ -59,7 +58,7 @@ def test_slow_burn_rides_to_high_threshold(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
     # Flat usage: 98% < 99 threshold and no slope -> stay put.
     write_history(cfg, "alt1", [(NOW - 600, 98), (NOW - 60, 98)])
 

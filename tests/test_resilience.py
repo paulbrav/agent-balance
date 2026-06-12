@@ -2,8 +2,7 @@
 
 import json
 
-from conftest import NOW, add_account, make_fetcher, usage
-from test_tick import H2, HD, setup_installed
+from conftest import H2, HD, NOW, add_account, install_pool, make_fetcher, usage
 
 import agent_balance as ab
 
@@ -63,7 +62,7 @@ def test_tick_extrapolates_stale_data(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
     # Last good numbers are 5 minutes old at 80%; observed slope 0.05%/s
     # means ~95% now — past the 85 threshold even though the endpoint is
     # rate-limiting.

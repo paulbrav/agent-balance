@@ -5,37 +5,16 @@ import json
 import os
 import stat
 
-from conftest import NOW, add_account, make_fetcher, usage
+from conftest import H2, HD, NOW, add_account, install_pool, run_tick, usage
 
 import agent_balance as ab
-
-H2 = NOW + 7200
-HD = NOW + 302400
-
-
-def setup_installed(cfg, account):
-    cfg.pool.mkdir(parents=True)
-    sha = ab.copy_creds(account.creds, cfg.pool / ".credentials.json")
-    (cfg.pool / ".claude.json").write_text(
-        json.dumps({"oauthAccount": {"emailAddress": account.email}})
-    )
-    ab.write_state(
-        cfg,
-        {"installed": account.name, "blob_sha256": sha, "last_swap_epoch": NOW - 3600},
-    )
-
-
-def run_tick(cfg, table, now=NOW):
-    out = []
-    rc = ab.tick(cfg, now=now, fetcher=make_fetcher(table), out=out.append)
-    return rc, out
 
 
 def test_below_threshold_noop(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
     pool_before = (cfg.pool / ".credentials.json").read_bytes()
 
     rc, out = run_tick(cfg, {"tok-alt1": usage(50, 30, H2, HD)})
@@ -85,7 +64,7 @@ def test_threshold_swap_installs_best_other(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
 
     rc, out = run_tick(
         cfg,
@@ -110,7 +89,7 @@ def test_roll_bypasses_min_gap(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
     state = ab.read_state(cfg, NOW)
     state["last_swap_epoch"] = NOW - 30  # swapped 30s ago, gap is 300
     ab.write_state(cfg, state)
@@ -130,7 +109,7 @@ def test_expired_token_bypasses_gap(cfg):
     add_account(cfg, "alt1", expires_ms=(NOW - 60) * 1000)  # already expired
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
     state = ab.read_state(cfg, NOW)
     state["last_swap_epoch"] = NOW - 30
     ab.write_state(cfg, state)
@@ -145,7 +124,7 @@ def test_limited_probe_never_swaps_blind(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
 
     rc, out = run_tick(cfg, {"tok-alt1": "limited"})
 
@@ -187,7 +166,7 @@ def test_all_infeasible_leaves_creds_in_place(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    setup_installed(cfg, ab.by_name(accts, "alt1"))
+    install_pool(cfg, ab.by_name(accts, "alt1"))
     pool_before = (cfg.pool / ".credentials.json").read_bytes()
 
     rc, out = run_tick(
