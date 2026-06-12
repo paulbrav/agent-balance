@@ -85,7 +85,7 @@ def make_config(env: dict | None = None) -> Config:
     return Config(
         root=Path(root),
         cache=cache,
-        threshold=num("AGENT_BALANCE_THRESHOLD", 85),
+        threshold=num("AGENT_BALANCE_THRESHOLD", 99),
         min_gap=int(num("AGENT_BALANCE_MIN_GAP", 300)),
         interval=int(num("AGENT_BALANCE_INTERVAL", 60)),
         draw=num("AGENT_BALANCE_DRAW", 10),
@@ -262,7 +262,44 @@ def probe(account: Account, cfg: Config, now: float, fetcher=fetch_usage):
     result = fetcher(token)
     if isinstance(result, Usage):
         cache_put(cfg, account.name, result, now)
+        record_history(cfg, account.name, result, now)
     return result
+
+
+def record_history(cfg: Config, name: str, usage: Usage, now: float) -> None:
+    """Fresh probes only (cache hits would flatten the slope): an
+    append-only 'epoch five%' series feeding burn_rate."""
+    try:
+        cfg.cache.mkdir(parents=True, exist_ok=True)
+        path = cfg.cache / f"{name}.history"
+        with path.open("a") as f:
+            f.write(f"{int(now)} {usage.five}\n")
+        lines = path.read_text().splitlines()
+        if len(lines) > 200:
+            atomic_write(path, ("\n".join(lines[-100:]) + "\n").encode(),
+                         mode=0o644)
+    except OSError:
+        pass
+
+
+def burn_rate(cfg: Config, name: str, now: float, window: int = 900) -> float:
+    """5h-window burn in %/second over the recent probe history; 0 when
+    there isn't enough signal or usage fell (window reset)."""
+    points = []
+    try:
+        for line in (cfg.cache / f"{name}.history").read_text().splitlines():
+            epoch_s, five_s = line.split()
+            epoch = int(epoch_s)
+            if now - epoch <= window:
+                points.append((epoch, float(five_s)))
+    except (OSError, ValueError):
+        return 0.0
+    if len(points) < 2:
+        return 0.0
+    (e0, f0), (e1, f1) = points[0], points[-1]
+    if e1 - e0 < 60:
+        return 0.0
+    return max((f1 - f0) / (e1 - e0), 0.0)
 
 
 # ------------------------------------------------------------ pick policy ---
@@ -527,9 +564,20 @@ def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
                 return 0
             else:
                 five_now = normalized(st, now).five
+                # Projection guard: a high threshold is only safe if a fast
+                # burn can't blow through the blind spot between probes —
+                # swap early when the recent slope says 100% lands within
+                # two tick intervals.
+                rate = burn_rate(cfg, installed.name, now)
+                lookahead = 2 * cfg.interval
                 if five_now >= cfg.threshold:
                     need = "soft"
                     reason = f"5h at {five_now:.0f}% >= {cfg.threshold:.0f}"
+                elif five_now + rate * lookahead >= 100:
+                    need = "soft"
+                    reason = (f"5h at {five_now:.0f}% burning "
+                              f"{rate * 60:.1f}%/min — projected past 100% "
+                              f"within {lookahead}s")
 
         if need is None:
             out(f"agent-balance: {installed.name} at {five_now:.0f}% 5h — ok")

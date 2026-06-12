@@ -48,10 +48,15 @@ there is unimplemented). Python 3.10+, stdlib only.
   and skills are shared.
 - Every 60s a tick polls the installed account's 5h/7d windows (the same
   OAuth usage endpoint agent-pick reads, cached 45s). When the 5-hour window
-  crosses the threshold (default 85%) — or the installed token is expired —
+  crosses the threshold (default 99%) — or the installed token is expired —
   it picks the best other feasible account (agent-pick's weekly-pace policy,
   capacity-weighted) and atomically copies its credentials into the pool.
   Every running pool session follows on its next turn.
+- **Burn-rate projection** makes the high threshold safe: the tick tracks
+  the slope of recent probes, and if `current% + rate × two ticks` crosses
+  100%, it swaps early regardless of the threshold. Slow burn rides the
+  window to 99%; an 8-wide workflow burning several %/minute rotates with
+  exactly the margin it needs.
 - **Write-back sync:** Claude Code refreshes OAuth tokens in the live dir,
   and refresh tokens must be assumed to rotate. Each tick reconciles the pool
   with the installed account's home dir — whichever side holds the newer
@@ -100,7 +105,7 @@ Tuning (env vars, also honored by the systemd unit if set at install time):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AGENT_BALANCE_THRESHOLD` | `85` | swap when the installed account's 5h window reaches this % |
+| `AGENT_BALANCE_THRESHOLD` | `99` | swap when the installed account's 5h window reaches this % (the burn-rate projection can swap earlier) |
 | `AGENT_BALANCE_MIN_GAP` | `300` | minimum seconds between threshold-driven swaps (expired tokens bypass this) |
 | `AGENT_BALANCE_INTERVAL` | `60` | tick cadence for `watch` and the timer |
 | `AGENT_BALANCE_DRAW` | `10` | 5h points a typical session is assumed to need (feasibility gate) |

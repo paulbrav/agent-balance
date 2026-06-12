@@ -51,10 +51,17 @@ One idempotent pass, every 60 s, serialized by `flock` on
    act blind on transient endpoint states.
 3. **Decide.** Hard need: no installed account, or its token is
    expired/missing. Soft need: 5h utilization at or above the threshold
-   (a window whose known reset has passed counts as 0%). Soft swaps respect
-   a minimum gap since the last swap (default 300 s) so near-threshold noise
-   can't flap; hard need bypasses the gap — a dead token must not be
-   hysteresis-limited.
+   (a window whose known reset has passed counts as 0%), **or** the
+   burn-rate projection fires — fresh probes append to a per-account
+   history, and when `current% + slope × two tick intervals` crosses 100%
+   the swap happens early. That's what makes the default 99% threshold
+   safe: the probe cache (45 s) plus tick cadence (60 s) leave a blind spot
+   a heavily parallel workflow could burn through, and the projection
+   covers exactly that window. (Residual risk: a burst that starts from a
+   cold history inside a single blind spot; heavy parallel users can set
+   `AGENT_BALANCE_INTERVAL=30`.) Soft swaps respect a minimum gap since the
+   last swap (default 300 s) so near-threshold noise can't flap; hard need
+   bypasses the gap — a dead token must not be hysteresis-limited.
 4. **Pick** the best *other* account using agent-pick's policy: feasibility
    first (5h room for a typical session, weekly not spent), then the account
    furthest behind its capacity-weighted weekly pace; in-band ties go to 5h
