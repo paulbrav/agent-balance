@@ -2,25 +2,9 @@
 
 import json
 
-from conftest import NOW, add_account
+from conftest import NOW, add_account, install_pool
 
 import agent_balance as ab
-
-
-def setup_pool(cfg, account, email=None):
-    """Pool holding a copy of the account's creds, with matching state."""
-    cfg.pool.mkdir(parents=True)
-    sha = ab.copy_creds(account.creds, cfg.pool / ".credentials.json")
-    (cfg.pool / ".claude.json").write_text(
-        json.dumps({"oauthAccount": {"emailAddress": email or account.email}})
-    )
-    state = {
-        "installed": account.name,
-        "blob_sha256": sha,
-        "last_swap_epoch": NOW - 3600,
-    }
-    ab.write_state(cfg, state)
-    return state
 
 
 def write_pool_blob(cfg, name, expires_ms):
@@ -40,7 +24,7 @@ def write_pool_blob(cfg, name, expires_ms):
 def test_refreshed_pool_blob_harvested_home(cfg):
     add_account(cfg, "alt1")
     accts = ab.discover_accounts(cfg)
-    state = setup_pool(cfg, accts[0])
+    state = install_pool(cfg, accts[0])
     # Claude Code refreshed the token in the pool: same email, newer expiry.
     write_pool_blob(cfg, "alt1", (NOW + 12 * 3600) * 1000)
 
@@ -58,7 +42,7 @@ def test_refreshed_pool_blob_harvested_home(cfg):
 def test_stale_pool_loses_to_newer_home(cfg):
     add_account(cfg, "alt1")
     accts = ab.discover_accounts(cfg)
-    state = setup_pool(cfg, accts[0])
+    state = install_pool(cfg, accts[0])
     # The account was used directly and refreshed at home.
     (cfg.root / "alt1" / ".credentials.json").write_text(
         json.dumps(
@@ -83,7 +67,7 @@ def test_manual_login_to_known_account_adopted(cfg):
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
-    state = setup_pool(cfg, ab.by_name(accts, "alt1"))
+    state = install_pool(cfg, ab.by_name(accts, "alt1"))
     # The user ran /login in a pool session and picked alt2: Claude rewrote
     # both the creds and the pool .claude.json email.
     write_pool_blob(cfg, "alt2", (NOW + 12 * 3600) * 1000)
@@ -104,7 +88,7 @@ def test_manual_login_to_known_account_adopted(cfg):
 def test_unknown_email_warns_once_touches_nothing(cfg):
     add_account(cfg, "alt1")
     accts = ab.discover_accounts(cfg)
-    state = setup_pool(cfg, accts[0])
+    state = install_pool(cfg, accts[0])
     home_before = (cfg.root / "alt1" / ".credentials.json").read_bytes()
     write_pool_blob(cfg, "mystery", (NOW + 12 * 3600) * 1000)
     (cfg.pool / ".claude.json").write_text(
@@ -126,7 +110,7 @@ def test_unknown_email_warns_once_touches_nothing(cfg):
 def test_corrupt_state_recovers_via_email(cfg):
     add_account(cfg, "alt1")
     accts = ab.discover_accounts(cfg)
-    setup_pool(cfg, accts[0])
+    install_pool(cfg, accts[0])
     cfg.state_file.write_text("not json {{{")
 
     state = ab.read_state(cfg, NOW)

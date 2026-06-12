@@ -1,13 +1,8 @@
 """pick_target — port of agent-pick's best_account scenarios."""
 
-from conftest import NOW, add_account, usage
+from conftest import D4, D7, H2, HD, NOW, add_account, usage
 
 import agent_balance as ab
-
-D4 = NOW + 4 * 86400  # weekly reset 4 days out (~43% of week elapsed)
-D7 = NOW + 7 * 86400  # weekly window just rolled over
-HD = NOW + 302400  # half the week left (50% elapsed)
-H2 = NOW + 7200  # active 5h window, 2h to reset
 
 
 def accounts_for(cfg, specs):
