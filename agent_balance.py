@@ -77,6 +77,21 @@ class Config:
         return self.root / ".balancer-lock"
 
 
+# Every knob make_config reads. cmd_install persists the set ones into the
+# systemd unit, so the timer sees the same config as the installing shell —
+# a knob missing here would silently reset to its default under the timer.
+ENV_KEYS = (
+    "AGENT_PICK_ROOT",
+    "CLAUDE_ACCOUNTS_ROOT",
+    "XDG_CACHE_HOME",
+    "AGENT_BALANCE_THRESHOLD",
+    "AGENT_BALANCE_MIN_GAP",
+    "AGENT_BALANCE_INTERVAL",
+    "AGENT_BALANCE_DRAW",
+    "AGENT_BALANCE_PULL_MARGIN",
+)
+
+
 def make_config(env: Mapping[str, str] | None = None) -> Config:
     e: Mapping[str, str] = os.environ if env is None else env
 
@@ -1025,14 +1040,7 @@ def cmd_install(cfg: Config) -> int:
     cmd = str(exe) if os.access(exe, os.X_OK) else f"{sys.executable} {exe}"
     env_lines = "".join(
         f"Environment={key}={os.environ[key]}\n"
-        for key in (
-            "AGENT_PICK_ROOT",
-            "CLAUDE_ACCOUNTS_ROOT",
-            "AGENT_BALANCE_THRESHOLD",
-            "AGENT_BALANCE_MIN_GAP",
-            "AGENT_BALANCE_DRAW",
-            "AGENT_BALANCE_PULL_MARGIN",
-        )
+        for key in ENV_KEYS
         if os.environ.get(key)
     )
     service = (
