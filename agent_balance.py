@@ -437,33 +437,72 @@ def feasible_now(u: Usage, cfg: Config, now: float) -> bool:
     return (u.five + cfg.draw < 100 or soon) and u.seven < 100
 
 
-def pick_target(
+class Candidate(NamedTuple):
+    account: Account
+    usage: Usage  # normalized
+    feasible: bool
+    urgency: float
+
+
+def candidates(
     accounts: list[Account], stats: dict, exclude: str | None, now: float, cfg: Config
-) -> tuple[Account | None, bool]:
-    """Feasibility first (5h room for a typical session, weekly not
-    spent), then the highest-urgency account — the one whose remaining
-    week needs the highest sustained burn rate. Ties go to the earlier
-    weekly reset (EDF), then 5h headroom.
-    Returns (account, feasible) — (None, False) when nothing qualifies."""
+) -> list[Candidate]:
+    """One policy row per account with known usage. Consumes the
+    precomputed stats dict — never probes."""
     rows = []
     for a in accounts:
         if a.name == exclude or not isinstance(stats.get(a.name), Usage):
             continue
         u = normalized(stats[a.name], now)
-        rows.append((a, u, feasible_now(u, cfg, now), urgency(u, a.capacity, now)))
-    if not rows:
-        return None, False
+        rows.append(
+            Candidate(a, u, feasible_now(u, cfg, now), urgency(u, a.capacity, now))
+        )
+    return rows
 
-    cls = any(f for _, _, f, _ in rows)
-    pool = [r for r in rows if r[2] == cls]
 
-    def rank(r):
-        a, u, _, urg = r
-        eff_r7 = u.r7 if u.r7 > now else now + WEEK
-        return (urg, -eff_r7, 100 - u.five, a.name)
+def rank(c: Candidate, now: float):
+    """Urgency first; ties go to the earlier weekly reset (EDF), then 5h
+    headroom, then name for determinism."""
+    eff_r7 = c.usage.r7 if c.usage.r7 > now else now + WEEK
+    return (c.urgency, -eff_r7, 100 - c.usage.five, c.account.name)
 
-    best = max(pool, key=rank)
-    return best[0], cls
+
+def pick_target(
+    accounts: list[Account], stats: dict, exclude: str | None, now: float, cfg: Config
+) -> Account | None:
+    """The highest-urgency feasible account (5h room for a typical
+    session, weekly not spent) — the one whose remaining week needs the
+    highest sustained burn rate. None when no account is feasible."""
+    feas = [c for c in candidates(accounts, stats, exclude, now, cfg) if c.feasible]
+    return max(feas, key=lambda c: rank(c, now)).account if feas else None
+
+
+def pick_pull_target(
+    accounts: list[Account],
+    stats: dict,
+    installed: Account,
+    inst_usage: Usage,
+    cfg: Config,
+    now: float,
+) -> tuple[Account, float, float] | None:
+    """The rebalance pull's winner, under two pull-specific rules: a
+    target must keep a typical session's draw below the swap threshold
+    (a proactive swap never moves onto an almost-walled account), and it
+    must beat the installed account's urgency by
+    max(pull_margin, 0.15 * installed urgency) — the flap hysteresis.
+    Ranking is deliberately urgency-only, first account winning ties (do
+    not harmonize with rank(), which would change tie outcomes).
+    Returns (winner, winner urgency, installed urgency) or None."""
+    u_inst = urgency(inst_usage, installed.capacity, now)
+    pool = [
+        c
+        for c in candidates(accounts, stats, installed.name, now, cfg)
+        if c.feasible and c.usage.five + cfg.draw < cfg.threshold
+    ]
+    best = max(pool, key=lambda c: c.urgency, default=None)
+    if best is None or best.urgency < u_inst + max(cfg.pull_margin, 0.15 * u_inst):
+        return None
+    return best.account, best.urgency, u_inst
 
 
 # ------------------------------------------------------ blobs and state ---
@@ -826,31 +865,13 @@ def tick(
             and cfg.pull_margin > 0
             and pull_due(cfg, now)
         ):
-            u_inst = urgency(st, installed.capacity, now)
             stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
-            best = None
-            for a in accounts:
-                if a.name == installed.name:
-                    continue
-                sa = stats.get(a.name)
-                if not isinstance(sa, Usage):
-                    continue
-                ua = normalized(sa, now)
-                # A pull target must have real 5h headroom — proactive
-                # swaps should never move onto an almost-walled account.
-                if not feasible_now(ua, cfg, now):
-                    continue
-                if ua.five + cfg.draw >= cfg.threshold:
-                    continue
-                u_a = urgency(ua, a.capacity, now)
-                if best is None or u_a > best[1]:
-                    best = (a, u_a, ua)
-            margin = max(cfg.pull_margin, 0.15 * u_inst)
-            if best is not None and best[1] >= u_inst + margin:
-                pulled, u_a, ua = best
+            pull = pick_pull_target(accounts, stats, installed, st, cfg, now)
+            if pull is not None:
+                pulled, u_best, u_inst = pull
                 need = "soft"
                 reason = (
-                    f"rebalance: {pulled.name} needs {u_a:.0f}%/day to clear "
+                    f"rebalance: {pulled.name} needs {u_best:.0f}%/day to clear "
                     f"its week vs {u_inst:.0f}%/day for {installed.name}"
                 )
 
@@ -871,11 +892,11 @@ def tick(
         if stats is None:
             stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
         if pulled is not None:
-            target, feasible = pulled, True
+            target = pulled
         else:
             exclude = installed.name if installed is not None else None
-            target, feasible = pick_target(accounts, stats, exclude, now, cfg)
-        if target is None or not feasible:
+            target = pick_target(accounts, stats, exclude, now, cfg)
+        if target is None:
             out(
                 f"agent-balance: swap due ({reason}) but no other account "
                 "is feasible; leaving credentials in place"
