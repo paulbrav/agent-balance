@@ -65,7 +65,7 @@ One idempotent pass, every 60 s, serialized by `flock` on
      optimization swap. (Residual risk: a burst starting from a cold
      history inside one blind spot; heavy users can set
      `AGENT_BALANCE_INTERVAL=30`.)
-   - **soft** — the **rebalance pull**: at most every 10 minutes the whole
+   - **soft** — the **rebalance pull**: at most every 5 minutes the whole
      fleet is probed, and if another feasible account's *urgency* beats
      the installed one's by `max(AGENT_BALANCE_PULL_MARGIN, 15%)`, the
      balancer rotates toward it proactively. Only soft swaps respect the

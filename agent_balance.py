@@ -676,12 +676,17 @@ class BalancerLock:
             os.close(self.fd)  # closing drops the flock
 
 
-PULL_CHECK = 600  # seconds between fleet probes for the deadline pull
+# Seconds between whole-fleet probes (the rebalance pull, and how stale the
+# tray's non-installed rows get). With a 4-account fleet this adds ~0.6
+# req/min to the installed account's 1/min — comfortably under the usage
+# endpoint's measured ~2-2.5 req/min per-IP allowance.
+PULL_CHECK = 300
 
 
 def pull_due(cfg: Config, now: float) -> bool:
-    """The deadline pull needs the whole fleet probed; rate-limit that to
-    once per PULL_CHECK so a steady tick stays ~1 request/minute."""
+    """The rebalance pull needs the whole fleet probed; rate-limit that to
+    once per PULL_CHECK so a steady tick stays well under the endpoint's
+    per-IP budget."""
     stamp = cfg.cache / "pull-check"
     try:
         if now - int(stamp.read_text().strip()) < PULL_CHECK:

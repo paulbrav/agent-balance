@@ -189,7 +189,7 @@ class Tray:
         tick.connect("activate", self.on_tick)
         menu.append(tick)
         refresh = Gtk.MenuItem(label="Refresh")
-        refresh.connect("activate", lambda *_: self.refresh())
+        refresh.connect("activate", self.on_refresh)
         menu.append(refresh)
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", Gtk.main_quit)
@@ -204,6 +204,19 @@ class Tray:
                 subprocess.run([exe, "tick"], capture_output=True)
             else:
                 ab.tick(ab.make_config(), out=lambda *_: None)
+            self.refresh()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_refresh(self, *_):
+        """Force a real fleet probe (staggered, cooldown-aware), then
+        redraw — unlike the passive 60s redraws, which are cache-only."""
+
+        def run():
+            cfg = ab.make_config()
+            now = time.time()
+            for a in ab.discover_accounts(cfg):
+                ab.probe(a, cfg, now)
             self.refresh()
 
         threading.Thread(target=run, daemon=True).start()

@@ -67,7 +67,7 @@ there is unimplemented). Python 3.10+, stdlib only.
   alive for bursts. In simulation this index matched an offline-lookahead
   oracle within tenths of a percent on both waste and blocked demand, and
   beat the previous schedule-pace metric on every scenario.
-- **Rebalance pull:** every ~10 minutes the tick probes the whole fleet
+- **Rebalance pull:** every ~5 minutes the tick probes the whole fleet
   and proactively swaps when another account's urgency beats the installed
   one's by a margin (default 10%/day, scaled up for high urgencies — the
   margin doubles as flap hysteresis). Sessions don't notice; expiring
