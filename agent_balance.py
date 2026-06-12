@@ -320,17 +320,10 @@ def throttle_fetch(cfg: Config) -> None:
     """Global (cross-process, file-based) spacing between real endpoint
     fetches, so fleet sweeps go out staggered instead of as a burst."""
     marker = cfg.cache / "last-fetch"
-    try:
-        wait = PROBE_SPACING - (time.time() - float(marker.read_text()))
-        if 0 < wait <= PROBE_SPACING:
-            time.sleep(wait)
-    except (OSError, ValueError):
-        pass
-    try:
-        cfg.cache.mkdir(parents=True, exist_ok=True)
-        marker.write_text(str(time.time()))
-    except OSError:
-        pass
+    wait = PROBE_SPACING - (time.time() - stamp_read(marker))
+    if 0 < wait <= PROBE_SPACING:
+        time.sleep(wait)
+    stamp_set(marker, time.time())
 
 
 def probe(account: Account, cfg: Config, now: float, fetcher=None):
@@ -353,11 +346,8 @@ def probe(account: Account, cfg: Config, now: float, fetcher=None):
         return word
 
     cooldown = cfg.cache / f"{account.name}.limited"
-    try:
-        if now - float(cooldown.read_text()) < LIMITED_COOLDOWN:
-            return stale_or("limited")
-    except (OSError, ValueError):
-        pass
+    if now - stamp_read(cooldown) < LIMITED_COOLDOWN:
+        return stale_or("limited")
 
     if fetcher is None:  # only the real network path is throttled
         throttle_fetch(cfg)
@@ -368,17 +358,10 @@ def probe(account: Account, cfg: Config, now: float, fetcher=None):
         result = replace(result, asof=now)
         cache_put(cfg, account.name, result)
         record_history(cfg, account.name, result, now)
-        try:
-            cooldown.unlink()
-        except OSError:
-            pass
+        stamp_clear(cooldown)
         return result
     if result == "limited":
-        try:
-            cfg.cache.mkdir(parents=True, exist_ok=True)
-            cooldown.write_text(str(now))
-        except OSError:
-            pass
+        stamp_set(cooldown, now)
     return stale_or(result)
 
 
@@ -396,16 +379,7 @@ def offline_view(account: Account, cfg: Config, now: float):
 def record_history(cfg: Config, name: str, usage: Usage, now: float) -> None:
     """Fresh probes only (cache hits would flatten the slope): an
     append-only 'epoch five%' series feeding burn_rate."""
-    try:
-        cfg.cache.mkdir(parents=True, exist_ok=True)
-        path = cfg.cache / f"{name}.history"
-        with path.open("a") as f:
-            f.write(f"{int(now)} {usage.five}\n")
-        lines = path.read_text().splitlines()
-        if len(lines) > 200:
-            atomic_write(path, ("\n".join(lines[-100:]) + "\n").encode(), mode=0o644)
-    except OSError:
-        pass
+    append_capped(cfg.cache / f"{name}.history", f"{int(now)} {usage.five}", 200, 100)
 
 
 def burn_rate(cfg: Config, name: str, now: float, window: int = 900) -> float:
@@ -517,6 +491,43 @@ def copy_creds(src: Path, dst: Path) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def stamp_read(path: Path) -> float:
+    """Epoch stored in a marker file; 0.0 when absent or malformed."""
+    try:
+        return float(path.read_text())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def stamp_set(path: Path, value: float) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(value))
+    except OSError:
+        pass
+
+
+def stamp_clear(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def append_capped(path: Path, line: str, cap: int, keep: int) -> None:
+    """Append one line; once the file exceeds cap lines, atomically trim
+    it to the newest keep."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(line + "\n")
+        lines = path.read_text().splitlines()
+        if len(lines) > cap:
+            atomic_write(path, ("\n".join(lines[-keep:]) + "\n").encode(), mode=0o644)
+    except OSError:
+        pass
+
+
 def read_state(cfg: Config, now: float) -> dict:
     state = read_json(cfg.state_file)
     installed = state.get("installed")
@@ -552,16 +563,7 @@ def write_state(cfg: Config, state: dict) -> None:
 
 
 def log_swap(cfg: Config, now: float, line: str) -> None:
-    try:
-        cfg.cache.mkdir(parents=True, exist_ok=True)
-        path = cfg.cache / "swaps"
-        with path.open("a") as f:
-            f.write(f"{int(now)} {line}\n")
-        lines = path.read_text().splitlines()
-        if len(lines) > 2000:
-            atomic_write(path, ("\n".join(lines[-1000:]) + "\n").encode(), mode=0o644)
-    except OSError:
-        pass
+    append_capped(cfg.cache / "swaps", f"{int(now)} {line}", 2000, 1000)
 
 
 # ------------------------------------------------- pool install / harvest ---
@@ -738,16 +740,9 @@ def pull_due(cfg: Config, now: float) -> bool:
     once per PULL_CHECK so a steady tick stays well under the endpoint's
     per-IP budget."""
     stamp = cfg.cache / "pull-check"
-    try:
-        if now - int(stamp.read_text().strip()) < PULL_CHECK:
-            return False
-    except (OSError, ValueError):
-        pass
-    try:
-        cfg.cache.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(str(int(now)))
-    except OSError:
-        pass
+    if now - stamp_read(stamp) < PULL_CHECK:
+        return False
+    stamp_set(stamp, int(now))
     return True
 
 
