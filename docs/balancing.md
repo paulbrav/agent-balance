@@ -85,16 +85,20 @@ One idempotent pass, every 60 s, serialized by `flock` on
    schedule-pace metric everywhere, and an explicit standby-reserve guard
    proved strictly harmful (the index already preserves burst capacity).
    Nothing feasible → report and leave credentials in place.
-5. **Install.** Bootstrap the pool if needed (symlink `projects/`+`skills/`
-   to the source account, copy `.claude.json`/`settings.json`), atomically
-   copy the target's credentials in (mode 600), stamp its `oauthAccount`,
-   record state, append to the swap log.
+5. **Install.** Journal the swap (`pending` in the state file), bootstrap
+   the pool if needed (symlink `projects/`+`skills/` to the source account,
+   copy `.claude.json`/`settings.json`), stamp the target's `oauthAccount`,
+   atomically copy its credentials in (mode 600), record final state (which
+   clears the journal), append to the swap log. The journal plus the
+   meta-before-creds order make a crash at any point recoverable: the next
+   harvest either finishes the swap or discards it, and never mistakes a
+   half-applied swap for a token refresh.
 
 State lives in `$ROOT/.balancer-state.json` (`installed`, `blob_sha256`,
-`last_swap_epoch`) — in the accounts root, not the cache, because losing the
-installed-account mapping is the one thing that risks a broken refresh chain.
-If it's deleted or corrupted, the next harvest re-identifies the pool blob by
-email and rebuilds it.
+`last_swap_epoch`, transiently `pending`) — in the accounts root, not the
+cache, because losing the installed-account mapping is the one thing that
+risks a broken refresh chain. If it's deleted or corrupted, the next harvest
+re-identifies the pool blob by email and rebuilds it.
 
 ## The refresh-rotation risk, quantified
 
