@@ -45,6 +45,7 @@ from typing import NamedTuple
 VERSION = "0.3.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_TTL = 45  # seconds a successful usage probe stays cached
+USAGE_STALE_AFTER = 2 * USAGE_TTL  # age before status renderers flag the data
 RESET_SOON = 900  # a 5h window resetting within this is treated as open
 WEEK = 7 * 86400
 
@@ -931,22 +932,24 @@ def tick(
 # ------------------------------------------------------------- commands ---
 
 
+def reset_in(epoch: int, now: float) -> str:
+    """Compact reset countdown — shared by cmd_status and the tray."""
+    if epoch == 0:
+        return "-"
+    s = epoch - now
+    if s <= 0:
+        return "now"
+    if s < 3600:
+        return f"{int(s // 60) + 1}m"
+    if s < 86400:
+        return f"{round(s / 3600)}h"
+    return f"{round(s / 86400)}d"
+
+
 def cmd_status(cfg: Config) -> int:
     now = time.time()
     accounts = discover_accounts(cfg)
     state = read_state(cfg, now)
-
-    def reset_in(epoch: int) -> str:
-        s = epoch - now
-        if epoch == 0:
-            return "-"
-        if s <= 0:
-            return "now"
-        if s < 3600:
-            return f"{int(s // 60) + 1}m"
-        if s < 86400:
-            return f"{round(s / 3600)}h"
-        return f"{round(s / 86400)}d"
 
     print(f"accounts ({cfg.root}):")
     for a in accounts:
@@ -954,12 +957,12 @@ def cmd_status(cfg: Config) -> int:
         mark = " <- installed" if a.name == state["installed"] else ""
         if isinstance(st, Usage):
             age = ""
-            if st.asof and now - st.asof > 2 * USAGE_TTL:
+            if st.asof and now - st.asof > USAGE_STALE_AFTER:
                 age = f" [{(now - st.asof) / 60:.0f}m old]"
             print(
                 f"  {a.name:<12} {a.email:<32} "
-                f"5h {st.five:3.0f}% ({reset_in(st.r5)})  "
-                f"7d {st.seven:3.0f}% ({reset_in(st.r7)}){age}{mark}"
+                f"5h {st.five:3.0f}% ({reset_in(st.r5, now)})  "
+                f"7d {st.seven:3.0f}% ({reset_in(st.r7, now)}){age}{mark}"
             )
         else:
             print(f"  {a.name:<12} {a.email:<32} {st}{mark}")
