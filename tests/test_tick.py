@@ -104,21 +104,17 @@ def test_threshold_swap_installs_best_other(cfg):
     assert any("swapped alt1 -> alt2" in line for line in out)
 
 
-def test_min_gap_suppresses_soft_swap(cfg):
+def test_roll_bypasses_min_gap(cfg):
+    """A 5h-wall roll is a safety action: it must never wait out the
+    hysteresis gap behind a recent optimization swap."""
     add_account(cfg, "alt1")
     add_account(cfg, "alt2")
     accts = ab.discover_accounts(cfg)
     setup_installed(cfg, ab.by_name(accts, "alt1"))
     state = ab.read_state(cfg, NOW)
-    state["last_swap_epoch"] = NOW - 30
+    state["last_swap_epoch"] = NOW - 30  # swapped 30s ago, gap is 300
     ab.write_state(cfg, state)
 
-    rc, out = run_tick(cfg, {"tok-alt1": usage(90, 40, H2, HD)})
-    assert any("inside the" in line for line in out)
-    assert ab.read_state(cfg, NOW)["installed"] == "alt1"
-
-    state["last_swap_epoch"] = NOW - 400
-    ab.write_state(cfg, state)
     rc, out = run_tick(
         cfg,
         {
@@ -127,6 +123,7 @@ def test_min_gap_suppresses_soft_swap(cfg):
         },
     )
     assert ab.read_state(cfg, NOW)["installed"] == "alt2"
+    assert any("swapped alt1 -> alt2" in line for line in out)
 
 
 def test_expired_token_bypasses_gap(cfg):

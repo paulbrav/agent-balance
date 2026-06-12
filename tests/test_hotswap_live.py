@@ -82,8 +82,7 @@ def test_running_session_follows_swap(tmp_path):
         min_gap=0,
         interval=60,
         draw=0,
-        pull_hours=0,
-        pull_margin=20,
+        pull_margin=0,
     )
 
     out = []

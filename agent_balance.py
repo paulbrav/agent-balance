@@ -41,10 +41,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_TTL = 45  # seconds a successful usage probe stays cached
-PACE_BAND = 5.0  # weekly paces within this many points count as tied
 RESET_SOON = 900  # a 5h window resetting within this is treated as open
 WEEK = 7 * 86400
 
@@ -60,8 +59,8 @@ class Config:
     min_gap: int  # seconds between threshold-driven swaps
     interval: int  # watch-loop / timer cadence
     draw: float  # 5h points a typical session is assumed to consume
-    pull_hours: float  # rotate toward a week expiring within this (0 = off)
-    pull_margin: float  # ...if its weighted pace wins by at least this much
+    pull_margin: float  # proactive swap when another account's urgency
+    #                     (%/day) beats the installed one's by this (0 = off)
 
     @property
     def pool(self) -> Path:
@@ -101,8 +100,7 @@ def make_config(env: Mapping[str, str] | None = None) -> Config:
         min_gap=int(num("AGENT_BALANCE_MIN_GAP", 300)),
         interval=int(num("AGENT_BALANCE_INTERVAL", 60)),
         draw=num("AGENT_BALANCE_DRAW", 10),
-        pull_hours=num("AGENT_BALANCE_PULL_HOURS", 24),
-        pull_margin=num("AGENT_BALANCE_PULL_MARGIN", 20),
+        pull_margin=num("AGENT_BALANCE_PULL_MARGIN", 10),
     )
 
 
@@ -428,12 +426,18 @@ def normalized(usage: Usage, now: float) -> Usage:
     return Usage(five, seven, usage.r5, usage.r7)
 
 
-def weekly_pace(u: Usage, capacity: float, now: float) -> float:
-    """Capacity-weighted points ahead of (+) or behind (-) the weekly pace
-    line. Minimizing this deliberately favors accounts whose week is about
-    to reset with allowance unused — that allowance is use-it-or-lose-it."""
-    elapsed = (WEEK - (u.r7 - now)) / WEEK * 100 if u.r7 > now else 0.0
-    return (u.seven - elapsed) * capacity
+def urgency(u: Usage, capacity: float, now: float) -> float:
+    """Required burn rate in capacity-weighted %/day: weekly allowance
+    remaining divided by days until it expires. The account that needs the
+    highest sustained rate to avoid wasting its week is served first —
+    urgency diverges as a reset nears (recovering EDF's waste behavior)
+    while level-loading earlier in the week, which keeps more accounts'
+    5h windows alive for bursts. Replaces the old additive pace metric
+    (used% - elapsed%), which carried no deadline information."""
+    un = normalized(u, now)
+    remaining = 100.0 - un.seven
+    days = (u.r7 - now) / 86400 if u.r7 > now else 7.0
+    return remaining / max(days, 1 / 24) * capacity
 
 
 def feasible_now(u: Usage, cfg: Config, now: float) -> bool:
@@ -446,24 +450,29 @@ def feasible_now(u: Usage, cfg: Config, now: float) -> bool:
 def pick_target(
     accounts: list[Account], stats: dict, exclude: str | None, now: float, cfg: Config
 ) -> tuple[Account | None, bool]:
-    """agent-pick's two-stage rule, minus the learned-draw machinery:
-    feasibility-gate the 5h window, then prefer the account furthest behind
-    its capacity-weighted weekly pace; in-band ties go to 5h headroom.
+    """Feasibility first (5h room for a typical session, weekly not
+    spent), then the highest-urgency account — the one whose remaining
+    week needs the highest sustained burn rate. Ties go to the earlier
+    weekly reset (EDF), then 5h headroom.
     Returns (account, feasible) — (None, False) when nothing qualifies."""
     rows = []
     for a in accounts:
         if a.name == exclude or not isinstance(stats.get(a.name), Usage):
             continue
         u = normalized(stats[a.name], now)
-        rows.append((a, u, feasible_now(u, cfg, now), weekly_pace(u, a.capacity, now)))
+        rows.append((a, u, feasible_now(u, cfg, now), urgency(u, a.capacity, now)))
     if not rows:
         return None, False
 
     cls = any(f for _, _, f, _ in rows)
     pool = [r for r in rows if r[2] == cls]
-    minp = min(r[3] for r in pool)
-    band = [r for r in pool if r[3] <= minp + PACE_BAND]
-    best = max(band, key=lambda r: (100 - r[1].five, -r[3], r[0].name))
+
+    def rank(r):
+        a, u, _, urg = r
+        eff_r7 = u.r7 if u.r7 > now else now + WEEK
+        return (urg, -eff_r7, 100 - u.five, a.name)
+
+    best = max(pool, key=rank)
     return best[0], cls
 
 
@@ -744,30 +753,30 @@ def tick(
                     est = f" (estimated from {age / 60:.0f}m-old data)"
                 lookahead = 2 * cfg.interval
                 if five_now >= cfg.threshold:
-                    need = "soft"
+                    need = "roll"
                     reason = f"5h at {five_now:.0f}%{est} >= {cfg.threshold:.0f}"
                 elif five_now + rate * lookahead >= 100:
-                    need = "soft"
+                    need = "roll"
                     reason = (
                         f"5h at {five_now:.0f}% burning "
                         f"{rate * 60:.1f}%/min — projected past 100% "
                         f"within {lookahead}s{est}"
                     )
 
-        # Deadline pull: even when the installed account is fine, rotate
-        # toward an account whose weekly window expires soon with serious
-        # allowance unused — sessions don't notice, and that allowance is
-        # gone at the reset.
+        # Rebalance pull: even when the installed account is fine, rotate
+        # toward a markedly more urgent account — one whose remaining week
+        # needs a much higher burn rate to avoid expiring unused. Sessions
+        # don't notice the swap. The margin is the hysteresis: after the
+        # pull, no other account clears the bar against the new installed.
         stats = pulled = None
         if (
             need is None
             and installed is not None
             and isinstance(st, Usage)
-            and cfg.pull_hours > 0
+            and cfg.pull_margin > 0
             and pull_due(cfg, now)
         ):
-            st_n = normalized(st, now)
-            installed_pace = weekly_pace(st_n, installed.capacity, now)
+            u_inst = urgency(st, installed.capacity, now)
             stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
             best = None
             for a in accounts:
@@ -777,26 +786,31 @@ def tick(
                 if not isinstance(sa, Usage):
                     continue
                 ua = normalized(sa, now)
+                # A pull target must have real 5h headroom — proactive
+                # swaps should never move onto an almost-walled account.
                 if not feasible_now(ua, cfg, now):
                     continue
-                if not now < ua.r7 <= now + cfg.pull_hours * 3600:
+                if ua.five + cfg.draw >= cfg.threshold:
                     continue
-                pace = weekly_pace(ua, a.capacity, now)
-                if best is None or pace < best[1]:
-                    best = (a, pace, ua)
-            if best is not None and best[1] <= installed_pace - cfg.pull_margin:
-                pulled, _, ua = best
+                u_a = urgency(ua, a.capacity, now)
+                if best is None or u_a > best[1]:
+                    best = (a, u_a, ua)
+            margin = max(cfg.pull_margin, 0.15 * u_inst)
+            if best is not None and best[1] >= u_inst + margin:
+                pulled, u_a, ua = best
                 need = "soft"
                 reason = (
-                    f"deadline pull: {pulled.name} has "
-                    f"{100 - ua.seven:.0f}% of its week unused, "
-                    f"{(ua.r7 - now) / 3600:.0f}h until reset"
+                    f"rebalance: {pulled.name} needs {u_a:.0f}%/day to clear "
+                    f"its week vs {u_inst:.0f}%/day for {installed.name}"
                 )
 
         if need is None:
             assert installed is not None  # need would be "hard" otherwise
             out(f"agent-balance: {installed.name} at {five_now:.0f}% 5h{est} — ok")
             return 0
+        # min_gap damps optimization churn only — a 5h-wall roll ("roll")
+        # or a dead token ("hard") must never wait out a hysteresis gap
+        # behind a routine rebalance swap.
         if need == "soft" and now - state["last_swap_epoch"] < cfg.min_gap:
             out(
                 f"agent-balance: swap due ({reason}) but inside the "
@@ -934,7 +948,6 @@ def cmd_install(cfg: Config) -> int:
             "AGENT_BALANCE_THRESHOLD",
             "AGENT_BALANCE_MIN_GAP",
             "AGENT_BALANCE_DRAW",
-            "AGENT_BALANCE_PULL_HOURS",
             "AGENT_BALANCE_PULL_MARGIN",
         )
         if os.environ.get(key)

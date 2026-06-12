@@ -49,31 +49,42 @@ One idempotent pass, every 60 s, serialized by `flock` on
 2. **Probe the installed account** (cache-first, 45 s TTL).
    `limited`/`error` probes never trigger a swap — the balancer refuses to
    act blind on transient endpoint states.
-3. **Decide.** Hard need: no installed account, or its token is
-   expired/missing. Soft need: 5h utilization at or above the threshold
-   (a window whose known reset has passed counts as 0%), **or** the
-   burn-rate projection fires — fresh probes append to a per-account
-   history, and when `current% + slope × two tick intervals` crosses 100%
-   the swap happens early. That's what makes the default 99% threshold
-   safe: the probe cache (45 s) plus tick cadence (60 s) leave a blind spot
-   a heavily parallel workflow could burn through, and the projection
-   covers exactly that window. (Residual risk: a burst that starts from a
-   cold history inside a single blind spot; heavy parallel users can set
-   `AGENT_BALANCE_INTERVAL=30`.) Soft swaps respect a minimum gap since the
-   last swap (default 300 s) so near-threshold noise can't flap; hard need
-   bypasses the gap — a dead token must not be hysteresis-limited.
-   A third soft trigger is the **deadline pull**: at most every 10 minutes
-   the whole fleet is probed, and if another feasible account's weekly
-   window expires within `AGENT_BALANCE_PULL_HOURS` (24) holding a weighted
-   pace at least `AGENT_BALANCE_PULL_MARGIN` (20) points better than the
-   installed account's, the balancer rotates toward it proactively —
-   expiring weekly allowance is use-it-or-lose-it. The margin doubles as
-   hysteresis: after the pull, no other account clears the bar, so it
-   can't flap.
-4. **Pick** the best *other* account using agent-pick's policy: feasibility
-   first (5h room for a typical session, weekly not spent), then the account
-   furthest behind its capacity-weighted weekly pace; in-band ties go to 5h
-   headroom. Nothing feasible → report and leave credentials in place.
+3. **Decide.** Three trigger classes, deliberately separated:
+   - **hard** — no installed account, or its token expired/missing. Always
+     acts immediately.
+   - **roll** — the 5h wall: utilization at/above the threshold (a window
+     whose known reset has passed counts as 0%), or the burn-rate
+     projection fires — fresh probes append to a per-account history, and
+     when `current% + slope × two tick intervals` crosses 100% the swap
+     happens early. That's what makes the default 99% threshold safe: the
+     probe cache (45 s) plus tick cadence (60 s) leave a blind spot a
+     heavily parallel workflow could burn through, and the projection
+     covers exactly that window. Stale numbers (rate-limited endpoint) are
+     extrapolated forward by the same slope. Rolls are safety actions and
+     **bypass the hysteresis gap** — they must never queue behind a recent
+     optimization swap. (Residual risk: a burst starting from a cold
+     history inside one blind spot; heavy users can set
+     `AGENT_BALANCE_INTERVAL=30`.)
+   - **soft** — the **rebalance pull**: at most every 10 minutes the whole
+     fleet is probed, and if another feasible account's *urgency* beats
+     the installed one's by `max(AGENT_BALANCE_PULL_MARGIN, 15%)`, the
+     balancer rotates toward it proactively. Only soft swaps respect the
+     minimum gap since the last swap (default 300 s); the margin doubles
+     as hysteresis — after the pull no other account clears the bar.
+4. **Pick** by *urgency* = weekly allowance remaining ÷ days to its reset,
+   capacity-weighted — the required sustained burn rate to avoid wasting
+   the week (the critical-ratio / least-laxity index from deadline
+   scheduling; weekly allowance is use-it-or-lose-it). Feasibility first
+   (5h room for a typical session, weekly not spent); ties go to the
+   earlier reset (EDF), then 5h headroom; pull targets additionally need
+   real 5h headroom (`5h% + draw < threshold`). Urgency diverges as a
+   reset nears, so no special deadline case is needed, and level-loading
+   earlier in the week keeps more accounts' 5h windows alive for bursts —
+   in 200-seed simulation this index tracked an offline-lookahead oracle
+   within tenths of a point on waste and blocked demand, beat the old
+   schedule-pace metric everywhere, and an explicit standby-reserve guard
+   proved strictly harmful (the index already preserves burst capacity).
+   Nothing feasible → report and leave credentials in place.
 5. **Install.** Bootstrap the pool if needed (symlink `projects/`+`skills/`
    to the source account, copy `.claude.json`/`settings.json`), atomically
    copy the target's credentials in (mode 600), stamp its `oauthAccount`,
