@@ -58,6 +58,8 @@ class Config:
     min_gap: int      # seconds between threshold-driven swaps
     interval: int     # watch-loop / timer cadence
     draw: float       # 5h points a typical session is assumed to consume
+    pull_hours: float   # rotate toward a week expiring within this (0 = off)
+    pull_margin: float  # ...if its weighted pace wins by at least this much
 
     @property
     def pool(self) -> Path: return self.root / ".active"
@@ -89,6 +91,8 @@ def make_config(env: dict | None = None) -> Config:
         min_gap=int(num("AGENT_BALANCE_MIN_GAP", 300)),
         interval=int(num("AGENT_BALANCE_INTERVAL", 60)),
         draw=num("AGENT_BALANCE_DRAW", 10),
+        pull_hours=num("AGENT_BALANCE_PULL_HOURS", 24),
+        pull_margin=num("AGENT_BALANCE_PULL_MARGIN", 20),
     )
 
 
@@ -315,6 +319,21 @@ def normalized(usage: Usage, now: float) -> Usage:
     return Usage(five, seven, usage.r5, usage.r7)
 
 
+def weekly_pace(u: Usage, capacity: float, now: float) -> float:
+    """Capacity-weighted points ahead of (+) or behind (-) the weekly pace
+    line. Minimizing this deliberately favors accounts whose week is about
+    to reset with allowance unused — that allowance is use-it-or-lose-it."""
+    elapsed = (WEEK - (u.r7 - now)) / WEEK * 100 if u.r7 > now else 0.0
+    return (u.seven - elapsed) * capacity
+
+
+def feasible_now(u: Usage, cfg: Config, now: float) -> bool:
+    """Room for a typical session in the 5h window (or an imminent reset)
+    and a weekly window that isn't spent."""
+    soon = 0 < u.r5 and u.r5 - now <= RESET_SOON
+    return (u.five + cfg.draw < 100 or soon) and u.seven < 100
+
+
 def pick_target(accounts: list[Account], stats: dict, exclude: str | None,
                 now: float, cfg: Config) -> tuple[Account | None, bool]:
     """agent-pick's two-stage rule, minus the learned-draw machinery:
@@ -326,11 +345,8 @@ def pick_target(accounts: list[Account], stats: dict, exclude: str | None,
         if a.name == exclude or not isinstance(stats.get(a.name), Usage):
             continue
         u = normalized(stats[a.name], now)
-        soon = 0 < u.r5 and u.r5 - now <= RESET_SOON
-        feasible = (u.five + cfg.draw < 100 or soon) and u.seven < 100
-        elapsed = (WEEK - (u.r7 - now)) / WEEK * 100 if u.r7 > now else 0.0
-        wpace = (u.seven - elapsed) * a.capacity
-        rows.append((a, u, feasible, wpace))
+        rows.append((a, u, feasible_now(u, cfg, now),
+                     weekly_pace(u, a.capacity, now)))
     if not rows:
         return None, False
 
@@ -530,6 +546,26 @@ class BalancerLock:
             os.close(self.fd)  # closing drops the flock
 
 
+PULL_CHECK = 600  # seconds between fleet probes for the deadline pull
+
+
+def pull_due(cfg: Config, now: float) -> bool:
+    """The deadline pull needs the whole fleet probed; rate-limit that to
+    once per PULL_CHECK so a steady tick stays ~1 request/minute."""
+    stamp = cfg.cache / "pull-check"
+    try:
+        if now - int(stamp.read_text().strip()) < PULL_CHECK:
+            return False
+    except (OSError, ValueError):
+        pass
+    try:
+        cfg.cache.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(str(int(now)))
+    except OSError:
+        pass
+    return True
+
+
 def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
          out=print, lock_wait: float = 0.0) -> int:
     """One idempotent balance pass. Never raises for operational
@@ -579,6 +615,37 @@ def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
                               f"{rate * 60:.1f}%/min — projected past 100% "
                               f"within {lookahead}s")
 
+        # Deadline pull: even when the installed account is fine, rotate
+        # toward an account whose weekly window expires soon with serious
+        # allowance unused — sessions don't notice, and that allowance is
+        # gone at the reset.
+        stats = pulled = None
+        if need is None and cfg.pull_hours > 0 and pull_due(cfg, now):
+            st_n = normalized(st, now)
+            installed_pace = weekly_pace(st_n, installed.capacity, now)
+            stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
+            best = None
+            for a in accounts:
+                if a.name == installed.name:
+                    continue
+                sa = stats.get(a.name)
+                if not isinstance(sa, Usage):
+                    continue
+                ua = normalized(sa, now)
+                if not feasible_now(ua, cfg, now):
+                    continue
+                if not now < ua.r7 <= now + cfg.pull_hours * 3600:
+                    continue
+                pace = weekly_pace(ua, a.capacity, now)
+                if best is None or pace < best[1]:
+                    best = (a, pace, ua)
+            if best is not None and best[1] <= installed_pace - cfg.pull_margin:
+                pulled, _, ua = best
+                need = "soft"
+                reason = (f"deadline pull: {pulled.name} has "
+                          f"{100 - ua.seven:.0f}% of its week unused, "
+                          f"{(ua.r7 - now) / 3600:.0f}h until reset")
+
         if need is None:
             out(f"agent-balance: {installed.name} at {five_now:.0f}% 5h — ok")
             return 0
@@ -587,9 +654,13 @@ def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
                 f"{cfg.min_gap}s gap since the last one")
             return 0
 
-        stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
-        exclude = installed.name if installed is not None else None
-        target, feasible = pick_target(accounts, stats, exclude, now, cfg)
+        if stats is None:
+            stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
+        if pulled is not None:
+            target, feasible = pulled, True
+        else:
+            exclude = installed.name if installed is not None else None
+            target, feasible = pick_target(accounts, stats, exclude, now, cfg)
         if target is None or not feasible:
             out(f"agent-balance: swap due ({reason}) but no other account "
                 "is feasible; leaving credentials in place")
@@ -694,7 +765,8 @@ def cmd_install(cfg: Config) -> int:
         f"Environment={key}={os.environ[key]}\n"
         for key in ("AGENT_PICK_ROOT", "CLAUDE_ACCOUNTS_ROOT",
                     "AGENT_BALANCE_THRESHOLD", "AGENT_BALANCE_MIN_GAP",
-                    "AGENT_BALANCE_DRAW")
+                    "AGENT_BALANCE_DRAW", "AGENT_BALANCE_PULL_HOURS",
+                    "AGENT_BALANCE_PULL_MARGIN")
         if os.environ.get(key))
     service = (
         "[Unit]\n"

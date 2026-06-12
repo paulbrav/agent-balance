@@ -62,6 +62,14 @@ One idempotent pass, every 60 s, serialized by `flock` on
    `AGENT_BALANCE_INTERVAL=30`.) Soft swaps respect a minimum gap since the
    last swap (default 300 s) so near-threshold noise can't flap; hard need
    bypasses the gap — a dead token must not be hysteresis-limited.
+   A third soft trigger is the **deadline pull**: at most every 10 minutes
+   the whole fleet is probed, and if another feasible account's weekly
+   window expires within `AGENT_BALANCE_PULL_HOURS` (24) holding a weighted
+   pace at least `AGENT_BALANCE_PULL_MARGIN` (20) points better than the
+   installed account's, the balancer rotates toward it proactively —
+   expiring weekly allowance is use-it-or-lose-it. The margin doubles as
+   hysteresis: after the pull, no other account clears the bar, so it
+   can't flap.
 4. **Pick** the best *other* account using agent-pick's policy: feasibility
    first (5h room for a typical session, weekly not spent), then the account
    furthest behind its capacity-weighted weekly pace; in-band ties go to 5h

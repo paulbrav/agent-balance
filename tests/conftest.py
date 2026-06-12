@@ -24,6 +24,8 @@ def cfg(tmp_path, monkeypatch):
         min_gap=300,
         interval=60,
         draw=10,
+        pull_hours=0,  # the deadline pull is opt-in per test
+        pull_margin=20,
     )
 
 

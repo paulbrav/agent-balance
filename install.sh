@@ -16,12 +16,14 @@ mkdir -p "$BINDIR"
 src_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
 if [[ -n "$src_dir" && -f "$src_dir/agent_balance.py" ]]; then
   install -m 0755 "$src_dir/agent_balance.py" "$BINDIR/agent-balance"
-  echo "Installed $src_dir/agent_balance.py -> $BINDIR/agent-balance"
+  install -m 0755 "$src_dir/agent_balance_tray.py" "$BINDIR/agent-balance-tray"
+  echo "Installed agent-balance + agent-balance-tray -> $BINDIR/"
 else
-  # Piped install (curl ... | bash): fetch the script from GitHub.
+  # Piped install (curl ... | bash): fetch the scripts from GitHub.
   curl -fsSL "$REPO_RAW/agent_balance.py" -o "$BINDIR/agent-balance"
-  chmod 0755 "$BINDIR/agent-balance"
-  echo "Downloaded agent-balance -> $BINDIR/agent-balance"
+  curl -fsSL "$REPO_RAW/agent_balance_tray.py" -o "$BINDIR/agent-balance-tray"
+  chmod 0755 "$BINDIR/agent-balance" "$BINDIR/agent-balance-tray"
+  echo "Downloaded agent-balance + agent-balance-tray -> $BINDIR/"
 fi
 
 case ":$PATH:" in

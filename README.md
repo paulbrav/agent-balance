@@ -57,6 +57,12 @@ there is unimplemented). Python 3.10+, stdlib only.
   100%, it swaps early regardless of the threshold. Slow burn rides the
   window to 99%; an 8-wide workflow burning several %/minute rotates with
   exactly the margin it needs.
+- **Deadline pull:** weekly allowance is use-it-or-lose-it, so every ~10
+  minutes the tick also checks whether another account's weekly window
+  expires soon (default within 24h) with substantially more allowance left
+  than the installed account's pace (default 20 weighted points) — and
+  rotates toward it even though the installed account is fine. Sessions
+  don't notice; the expiring allowance gets used instead of wasted.
 - **Write-back sync:** Claude Code refreshes OAuth tokens in the live dir,
   and refresh tokens must be assumed to rotate. Each tick reconciles the pool
   with the installed account's home dir — whichever side holds the newer
@@ -109,7 +115,26 @@ Tuning (env vars, also honored by the systemd unit if set at install time):
 | `AGENT_BALANCE_MIN_GAP` | `300` | minimum seconds between threshold-driven swaps (expired tokens bypass this) |
 | `AGENT_BALANCE_INTERVAL` | `60` | tick cadence for `watch` and the timer |
 | `AGENT_BALANCE_DRAW` | `10` | 5h points a typical session is assumed to need (feasibility gate) |
+| `AGENT_BALANCE_PULL_HOURS` | `24` | deadline pull: rotate toward a weekly window expiring within this many hours (`0` disables) |
+| `AGENT_BALANCE_PULL_MARGIN` | `20` | ...only when its weighted weekly pace beats the installed account's by at least this many points |
 | `AGENT_PICK_ROOT` | `~/.claude-accounts` | accounts root, shared with agent-pick |
+
+## Tray indicator (GNOME)
+
+`agent-balance-tray` puts the account table in your system tray: the icon
+label shows the installed account and its 5h usage, and the dropdown renders
+every account's 5h/7d windows as colored bars (the agent-pick `--list` look),
+plus "Tick now". It reads the balancer's own probe cache, so it adds no API
+load.
+
+```bash
+agent-balance-tray                       # foreground
+agent-balance-tray --install-autostart   # start at every login
+```
+
+Needs the system Python's GObject bindings and an AppIndicator-capable shell
+(stock Ubuntu GNOME qualifies): `apt install python3-gi
+gir1.2-ayatanaappindicator3-0.1` if missing.
 
 ## Caveats
 

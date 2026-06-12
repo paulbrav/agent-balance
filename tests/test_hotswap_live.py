@@ -75,7 +75,8 @@ def test_running_session_follows_swap(tmp_path):
     # draw=0: feasibility must not block the forced swap when the second
     # account happens to be high in its 5h window.
     cfg = ab.Config(root=root, cache=tmp_path / "cache", threshold=0,
-                    min_gap=0, interval=60, draw=0)
+                    min_gap=0, interval=60, draw=0, pull_hours=0,
+                    pull_margin=20)
 
     out = []
     assert ab.tick(cfg, out=out.append) == 0
