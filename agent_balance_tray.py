@@ -54,8 +54,10 @@ def load_agent_balance():
                 "agent_balance", str(cand))
             spec = importlib.util.spec_from_loader("agent_balance", loader)
             mod = importlib.util.module_from_spec(spec)
-            loader.exec_module(mod)
+            # Register BEFORE exec: dataclass creation resolves the module
+            # through sys.modules when annotations are strings.
             sys.modules["agent_balance"] = mod
+            loader.exec_module(mod)
             return mod
     sys.exit("agent-balance-tray: agent_balance.py not found "
              "(install agent-balance or run from the repo)")
