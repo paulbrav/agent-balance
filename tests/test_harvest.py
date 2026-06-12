@@ -124,3 +124,92 @@ def test_missing_pool_is_a_noop(cfg):
     accts = ab.discover_accounts(cfg)
     state = ab.read_state(cfg, NOW)
     assert ab.harvest(cfg, accts, state, NOW, lambda *_: None) == state
+
+
+def journal_swap(cfg, state, target):
+    """The state a tick leaves behind right before the pool writes."""
+    state["pending"] = {"target": target.name, "src_sha": ab.sha256_file(target.creds)}
+    ab.write_state(cfg, state)
+
+
+def test_pending_swap_finishes_when_the_copy_landed(cfg):
+    add_account(cfg, "alt1")
+    add_account(cfg, "alt2")
+    accts = ab.discover_accounts(cfg)
+    state = install_pool(cfg, ab.by_name(accts, "alt1"))
+    alt2 = ab.by_name(accts, "alt2")
+    assert alt2 is not None
+    home_before = (cfg.root / "alt1" / ".credentials.json").read_bytes()
+    # Crash window: journal + pool writes landed, the final state write
+    # did not. The pool now holds alt2's blob under alt1's recorded state.
+    journal_swap(cfg, state, alt2)
+    ab.install_creds(cfg, alt2)
+
+    out = []
+    state = ab.harvest(cfg, accts, ab.read_state(cfg, NOW), NOW, out.append)
+
+    assert state["installed"] == "alt2"
+    assert "pending" not in ab.read_state(cfg, NOW)
+    assert any("interrupted swap" in line for line in out)
+    # The poison the journal exists to prevent: alt2's token must never be
+    # synced into alt1's home as a "refresh".
+    assert (cfg.root / "alt1" / ".credentials.json").read_bytes() == home_before
+
+
+def test_pending_swap_cleared_when_nothing_landed(cfg):
+    add_account(cfg, "alt1")
+    add_account(cfg, "alt2")
+    accts = ab.discover_accounts(cfg)
+    state = install_pool(cfg, ab.by_name(accts, "alt1"))
+    pool_before = (cfg.pool / ".credentials.json").read_bytes()
+    # Crash window: the journal landed but no pool write did.
+    journal_swap(cfg, state, ab.by_name(accts, "alt2"))
+
+    out = []
+    state = ab.harvest(cfg, accts, ab.read_state(cfg, NOW), NOW, out.append)
+
+    assert state["installed"] == "alt1"
+    assert "pending" not in ab.read_state(cfg, NOW)
+    assert (cfg.pool / ".credentials.json").read_bytes() == pool_before
+
+
+def test_pending_swap_with_foreign_pool_blob_goes_unknown(cfg):
+    add_account(cfg, "alt1")
+    add_account(cfg, "alt2")
+    accts = ab.discover_accounts(cfg)
+    state = install_pool(cfg, ab.by_name(accts, "alt1"))
+    alt1_home_before = (cfg.root / "alt1" / ".credentials.json").read_bytes()
+    alt2_home_before = (cfg.root / "alt2" / ".credentials.json").read_bytes()
+    # Crash window plus a concurrent writer: the pool blob matches neither
+    # the journaled copy nor the recorded one. Ownership is ambiguous.
+    journal_swap(cfg, state, ab.by_name(accts, "alt2"))
+    write_pool_blob(cfg, "alt1", (NOW + 12 * 3600) * 1000)
+
+    state = ab.harvest(cfg, accts, ab.read_state(cfg, NOW), NOW, lambda *_: None)
+
+    assert state["installed"] == "unknown"
+    assert "pending" not in ab.read_state(cfg, NOW)
+    assert (cfg.root / "alt1" / ".credentials.json").read_bytes() == alt1_home_before
+    assert (cfg.root / "alt2" / ".credentials.json").read_bytes() == alt2_home_before
+
+
+def test_meta_is_stamped_before_creds_are_copied(cfg, monkeypatch):
+    """A crash inside install_creds must leave the pool meta naming the
+    incoming account — the old email over the new blob is what poisoned
+    the old account's home before the reorder."""
+    add_account(cfg, "alt1")
+    add_account(cfg, "alt2")
+    accts = ab.discover_accounts(cfg)
+    install_pool(cfg, ab.by_name(accts, "alt1"))
+
+    def boom(src, dst):
+        raise OSError("crash before the creds copy")
+
+    alt2 = ab.by_name(accts, "alt2")
+    assert alt2 is not None
+    monkeypatch.setattr(ab, "copy_creds", boom)
+    try:
+        ab.install_creds(cfg, alt2)
+    except OSError:
+        pass
+    assert ab.meta_email(cfg.pool) == "alt2@example.com"

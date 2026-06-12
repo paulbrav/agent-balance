@@ -77,6 +77,7 @@ def test_threshold_swap_installs_best_other(cfg):
     state = ab.read_state(cfg, NOW)
     assert state["installed"] == "alt2"
     assert state["last_swap_epoch"] == NOW
+    assert "pending" not in state  # the swap journal must not outlive the swap
     assert (cfg.pool / ".credentials.json").read_bytes() == (
         cfg.root / "alt2" / ".credentials.json"
     ).read_bytes()
