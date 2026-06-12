@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+# Redundant under `uv run pytest` (editable install); kept so a bare
+# system `pytest` works from a fresh clone without uv.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent_balance as ab  # noqa: E402

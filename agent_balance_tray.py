@@ -31,8 +31,8 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+from gi.repository import GLib, Gtk
 
 GREEN, YELLOW, RED, DIM = "#73d216", "#edd400", "#ef2929", "#888888"
 BAR_ON, BAR_OFF = "▰", "▱"

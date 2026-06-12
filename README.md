@@ -143,8 +143,8 @@ Tuning (env vars, also honored by the systemd unit if set at install time):
 `agent-balance-tray` puts the account table in your system tray: the icon
 label shows the installed account and its 5h usage, and the dropdown renders
 every account's 5h/7d windows as colored bars (the agent-pick `--list` look),
-plus "Tick now". It reads the balancer's own probe cache, so it adds no API
-load.
+plus "Rebalance now". It reads the balancer's own probe cache, so it adds no
+API load; the "Refresh" item forces one staggered fleet probe on demand.
 
 ```bash
 agent-balance-tray                       # foreground
@@ -168,8 +168,10 @@ gir1.2-ayatanaappindicator3-0.1` if missing.
   ~/.claude-accounts/.active` rebuilds it on the next tick.
 - The usage endpoint is observed CLI behavior, not a documented public API,
   and enforces a short per-IP rate limit. Steady-state the balancer sends ~1
-  request/minute (installed account only; the fleet is probed only when a
-  swap is actually due).
+  request/minute for the installed account, plus a staggered whole-fleet
+  sweep every ~5 minutes for the rebalance pull (~0.6 req/min extra with 4
+  accounts; none with `AGENT_BALANCE_PULL_MARGIN=0`) — under the endpoint's
+  measured ~2-2.5 req/min per-IP allowance.
 - Rotating accounts to extend usage limits is not an endorsed pattern —
   this automates what `/login` does by hand, on your own paid accounts. Use
   your own judgment (same caveat as agent-pick).
