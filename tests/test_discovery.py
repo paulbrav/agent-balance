@@ -66,3 +66,13 @@ def test_capacity_read_from_agent_pick_json(cfg):
     assert alt1 is not None and alt2 is not None
     assert alt1.capacity == 20
     assert alt2.capacity == 1
+
+
+def test_env_keys_cover_every_make_config_knob():
+    """cmd_install persists ENV_KEYS into the systemd unit; a knob read by
+    make_config but missing there would silently reset under the timer."""
+    import inspect
+    import re
+
+    read = set(re.findall(r'"([A-Z][A-Z0-9_]*)"', inspect.getsource(ab.make_config)))
+    assert read and read <= set(ab.ENV_KEYS)
