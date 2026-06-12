@@ -13,7 +13,6 @@ import os
 import shutil
 import subprocess
 import time
-from pathlib import Path
 
 import pytest
 
@@ -21,7 +20,8 @@ import agent_balance as ab
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AGENT_BALANCE_LIVE") != "1",
-    reason="live test: set AGENT_BALANCE_LIVE=1 to run (burns 2 haiku turns)")
+    reason="live test: set AGENT_BALANCE_LIVE=1 to run (burns 2 haiku turns)",
+)
 
 
 def real_logged_in_accounts():
@@ -36,9 +36,10 @@ def real_logged_in_accounts():
 
 
 def send(proc, text):
-    msg = {"type": "user",
-           "message": {"role": "user",
-                       "content": [{"type": "text", "text": text}]}}
+    msg = {
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+    }
     proc.stdin.write(json.dumps(msg) + "\n")
     proc.stdin.flush()
 
@@ -74,27 +75,55 @@ def test_running_session_follows_swap(tmp_path):
         shutil.copy(ab.meta_path(src.home), home / ".claude.json")
     # draw=0: feasibility must not block the forced swap when the second
     # account happens to be high in its 5h window.
-    cfg = ab.Config(root=root, cache=tmp_path / "cache", threshold=0,
-                    min_gap=0, interval=60, draw=0, pull_hours=0,
-                    pull_margin=20)
+    cfg = ab.Config(
+        root=root,
+        cache=tmp_path / "cache",
+        threshold=0,
+        min_gap=0,
+        interval=60,
+        draw=0,
+        pull_hours=0,
+        pull_margin=20,
+    )
 
     out = []
     assert ab.tick(cfg, out=out.append) == 0
     first = ab.read_state(cfg, time.time())["installed"]
     assert first in (a.name, b.name)
 
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                        "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                        "CLAUDECODE")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDECODE",
+        )
+    }
     env["CLAUDE_CONFIG_DIR"] = str(cfg.pool)
     proc = subprocess.Popen(
-        ["claude", "-p", "--input-format", "stream-json",
-         "--output-format", "stream-json", "--verbose",
-         "--model", "claude-haiku-4-5-20251001"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1,
-        cwd=tmp_path)
+        [
+            "claude",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-haiku-4-5-20251001",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        text=True,
+        bufsize=1,
+        cwd=tmp_path,
+    )
     try:
         send(proc, "Reply with exactly: ALPHA")
         r1 = read_result(proc)
@@ -109,11 +138,13 @@ def test_running_session_follows_swap(tmp_path):
 
         send(proc, "Reply with exactly: BRAVO")
         r2 = read_result(proc)
-        assert r2 and not r2.get("is_error"), \
+        assert r2 and not r2.get("is_error"), (
             f"turn 2 failed after swap to {second}: {r2}"
+        )
     finally:
         try:
-            proc.stdin.close()
+            if proc.stdin:
+                proc.stdin.close()
         except OSError:
             pass
         try:

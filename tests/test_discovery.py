@@ -4,8 +4,9 @@ import json
 import os
 from pathlib import Path
 
-import agent_balance as ab
 from conftest import NOW, add_account
+
+import agent_balance as ab
 
 
 def test_main_meta_lives_at_home_root(cfg):
@@ -14,11 +15,19 @@ def test_main_meta_lives_at_home_root(cfg):
     home = Path(os.path.expanduser("~"))
     claude = home / ".claude"
     claude.mkdir()
-    (claude / ".credentials.json").write_text(json.dumps({
-        "claudeAiOauth": {"accessToken": "tok-main",
-                          "expiresAt": (NOW + 3600) * 1000}}))
-    (home / ".claude.json").write_text(json.dumps({
-        "oauthAccount": {"emailAddress": "main@example.com"}}))
+    (claude / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "tok-main",
+                    "expiresAt": (NOW + 3600) * 1000,
+                }
+            }
+        )
+    )
+    (home / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "main@example.com"}})
+    )
 
     accounts = ab.discover_accounts(cfg)
     main = ab.by_name(accounts, "main")
@@ -39,8 +48,9 @@ def test_non_claude_dirs_are_skipped(cfg):
     (grok / ".credentials.json").write_text("{}")
     kimi = cfg.root / "kimi"
     kimi.mkdir()
-    (kimi / "settings.json").write_text(json.dumps({
-        "env": {"ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic"}}))
+    (kimi / "settings.json").write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic"}})
+    )
     (kimi / ".credentials.json").write_text("{}")
     (cfg.root / "alt-fresh").mkdir()  # no credentials yet
 
@@ -52,5 +62,7 @@ def test_capacity_read_from_agent_pick_json(cfg):
     add_account(cfg, "alt1", capacity=20)
     add_account(cfg, "alt2")
     accounts = ab.discover_accounts(cfg)
-    assert ab.by_name(accounts, "alt1").capacity == 20
-    assert ab.by_name(accounts, "alt2").capacity == 1
+    alt1, alt2 = ab.by_name(accounts, "alt1"), ab.by_name(accounts, "alt2")
+    assert alt1 is not None and alt2 is not None
+    assert alt1.capacity == 20
+    assert alt2.capacity == 1

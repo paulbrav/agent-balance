@@ -36,54 +36,64 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 VERSION = "0.1.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-USAGE_TTL = 45        # seconds a successful usage probe stays cached
-PACE_BAND = 5.0       # weekly paces within this many points count as tied
-RESET_SOON = 900      # a 5h window resetting within this is treated as open
+USAGE_TTL = 45  # seconds a successful usage probe stays cached
+PACE_BAND = 5.0  # weekly paces within this many points count as tied
+RESET_SOON = 900  # a 5h window resetting within this is treated as open
 WEEK = 7 * 86400
 
 
 # ---------------------------------------------------------------- config ---
 
+
 @dataclass(frozen=True)
 class Config:
-    root: Path        # accounts root (agent-pick's $ROOT)
-    cache: Path       # this tool's cache dir
+    root: Path  # accounts root (agent-pick's $ROOT)
+    cache: Path  # this tool's cache dir
     threshold: float  # swap when the installed account's 5h% reaches this
-    min_gap: int      # seconds between threshold-driven swaps
-    interval: int     # watch-loop / timer cadence
-    draw: float       # 5h points a typical session is assumed to consume
-    pull_hours: float   # rotate toward a week expiring within this (0 = off)
+    min_gap: int  # seconds between threshold-driven swaps
+    interval: int  # watch-loop / timer cadence
+    draw: float  # 5h points a typical session is assumed to consume
+    pull_hours: float  # rotate toward a week expiring within this (0 = off)
     pull_margin: float  # ...if its weighted pace wins by at least this much
 
     @property
-    def pool(self) -> Path: return self.root / ".active"
+    def pool(self) -> Path:
+        return self.root / ".active"
 
     @property
-    def state_file(self) -> Path: return self.root / ".balancer-state.json"
+    def state_file(self) -> Path:
+        return self.root / ".balancer-state.json"
 
     @property
-    def lock_file(self) -> Path: return self.root / ".balancer-lock"
+    def lock_file(self) -> Path:
+        return self.root / ".balancer-lock"
 
 
-def make_config(env: dict | None = None) -> Config:
-    env = os.environ if env is None else env
+def make_config(env: Mapping[str, str] | None = None) -> Config:
+    e: Mapping[str, str] = os.environ if env is None else env
 
     def num(key: str, default: float) -> float:
         try:
-            return float(env.get(key, ""))
+            return float(e.get(key, ""))
         except ValueError:
             return default
 
-    root = env.get("AGENT_PICK_ROOT") or env.get("CLAUDE_ACCOUNTS_ROOT") \
+    root = (
+        e.get("AGENT_PICK_ROOT")
+        or e.get("CLAUDE_ACCOUNTS_ROOT")
         or os.path.expanduser("~/.claude-accounts")
-    cache = Path(env.get("XDG_CACHE_HOME")
-                 or os.path.expanduser("~/.cache")) / "agent-balance"
+    )
+    cache = (
+        Path(e.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"))
+        / "agent-balance"
+    )
     return Config(
         root=Path(root),
         cache=cache,
@@ -98,6 +108,7 @@ def make_config(env: dict | None = None) -> Config:
 
 # ------------------------------------------------------------- accounts ---
 
+
 @dataclass
 class Account:
     name: str
@@ -106,7 +117,8 @@ class Account:
     capacity: float
 
     @property
-    def creds(self) -> Path: return self.home / ".credentials.json"
+    def creds(self) -> Path:
+        return self.home / ".credentials.json"
 
 
 def read_json(path: Path) -> dict:
@@ -140,8 +152,7 @@ def is_claude_dir(d: Path) -> bool:
     kind = read_json(d / "agent-pick.json").get("kind")
     if kind not in (None, "claude"):
         return False
-    base = (read_json(d / "settings.json").get("env") or {}) \
-        .get("ANTHROPIC_BASE_URL")
+    base = (read_json(d / "settings.json").get("env") or {}).get("ANTHROPIC_BASE_URL")
     return not base
 
 
@@ -183,12 +194,13 @@ def by_email(accounts: list[Account], email: str) -> Account | None:
 
 # ----------------------------------------------------------- usage probe ---
 
+
 @dataclass
 class Usage:
-    five: float   # 5h window utilization %
+    five: float  # 5h window utilization %
     seven: float  # 7d window utilization %
-    r5: int       # 5h reset epoch (0 = unknown)
-    r7: int       # 7d reset epoch (0 = unknown)
+    r5: int  # 5h reset epoch (0 = unknown)
+    r7: int  # 7d reset epoch (0 = unknown)
 
 
 def parse_reset(value) -> int:
@@ -196,8 +208,7 @@ def parse_reset(value) -> int:
         return int(value)
     if isinstance(value, str):
         try:
-            return int(datetime.fromisoformat(
-                value.replace("Z", "+00:00")).timestamp())
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
         except ValueError:
             return 0
     return 0
@@ -207,11 +218,14 @@ def fetch_usage(token: str):
     """One GET against the OAuth usage endpoint -> Usage or a status word
     ('limited' on 429, 'error' otherwise). The endpoint enforces a short
     per-IP rate limit; callers must cache."""
-    req = urllib.request.Request(USAGE_URL, headers={
-        "Authorization": f"Bearer {token}",
-        "anthropic-beta": "oauth-2025-04-20",
-        "Content-Type": "application/json",
-    })
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
@@ -233,8 +247,7 @@ def cache_get(cfg: Config, name: str, now: float) -> Usage | None:
     entry = read_json(cfg.cache / name)
     try:
         if now - entry["epoch"] < USAGE_TTL:
-            return Usage(entry["five"], entry["seven"],
-                         entry["r5"], entry["r7"])
+            return Usage(entry["five"], entry["seven"], entry["r5"], entry["r7"])
     except (KeyError, TypeError):
         pass
     return None
@@ -243,9 +256,17 @@ def cache_get(cfg: Config, name: str, now: float) -> Usage | None:
 def cache_put(cfg: Config, name: str, usage: Usage, now: float) -> None:
     try:
         cfg.cache.mkdir(parents=True, exist_ok=True)
-        (cfg.cache / name).write_text(json.dumps({
-            "epoch": now, "five": usage.five, "seven": usage.seven,
-            "r5": usage.r5, "r7": usage.r7}))
+        (cfg.cache / name).write_text(
+            json.dumps(
+                {
+                    "epoch": now,
+                    "five": usage.five,
+                    "seven": usage.seven,
+                    "r5": usage.r5,
+                    "r7": usage.r7,
+                }
+            )
+        )
     except OSError:
         pass
 
@@ -280,8 +301,7 @@ def record_history(cfg: Config, name: str, usage: Usage, now: float) -> None:
             f.write(f"{int(now)} {usage.five}\n")
         lines = path.read_text().splitlines()
         if len(lines) > 200:
-            atomic_write(path, ("\n".join(lines[-100:]) + "\n").encode(),
-                         mode=0o644)
+            atomic_write(path, ("\n".join(lines[-100:]) + "\n").encode(), mode=0o644)
     except OSError:
         pass
 
@@ -307,6 +327,7 @@ def burn_rate(cfg: Config, name: str, now: float, window: int = 900) -> float:
 
 
 # ------------------------------------------------------------ pick policy ---
+
 
 def normalized(usage: Usage, now: float) -> Usage:
     """A window whose known reset has passed counts as 0% — it restarts on
@@ -334,8 +355,9 @@ def feasible_now(u: Usage, cfg: Config, now: float) -> bool:
     return (u.five + cfg.draw < 100 or soon) and u.seven < 100
 
 
-def pick_target(accounts: list[Account], stats: dict, exclude: str | None,
-                now: float, cfg: Config) -> tuple[Account | None, bool]:
+def pick_target(
+    accounts: list[Account], stats: dict, exclude: str | None, now: float, cfg: Config
+) -> tuple[Account | None, bool]:
     """agent-pick's two-stage rule, minus the learned-draw machinery:
     feasibility-gate the 5h window, then prefer the account furthest behind
     its capacity-weighted weekly pace; in-band ties go to 5h headroom.
@@ -345,8 +367,7 @@ def pick_target(accounts: list[Account], stats: dict, exclude: str | None,
         if a.name == exclude or not isinstance(stats.get(a.name), Usage):
             continue
         u = normalized(stats[a.name], now)
-        rows.append((a, u, feasible_now(u, cfg, now),
-                     weekly_pace(u, a.capacity, now)))
+        rows.append((a, u, feasible_now(u, cfg, now), weekly_pace(u, a.capacity, now)))
     if not rows:
         return None, False
 
@@ -359,6 +380,7 @@ def pick_target(accounts: list[Account], stats: dict, exclude: str | None,
 
 
 # ------------------------------------------------------ blobs and state ---
+
 
 def sha256_file(path: Path) -> str:
     try:
@@ -400,14 +422,16 @@ def read_state(cfg: Config, now: float) -> dict:
         sha = ""
     if not isinstance(epoch, (int, float)) or epoch < 0:
         epoch = 0
-    return {"installed": installed, "blob_sha256": sha,
-            "last_swap_epoch": min(int(epoch), int(now))}
+    return {
+        "installed": installed,
+        "blob_sha256": sha,
+        "last_swap_epoch": min(int(epoch), int(now)),
+    }
 
 
 def write_state(cfg: Config, state: dict) -> None:
     cfg.root.mkdir(parents=True, exist_ok=True)
-    atomic_write(cfg.state_file, json.dumps(state, indent=2).encode(),
-                 mode=0o644)
+    atomic_write(cfg.state_file, json.dumps(state, indent=2).encode(), mode=0o644)
 
 
 def log_swap(cfg: Config, now: float, line: str) -> None:
@@ -418,13 +442,13 @@ def log_swap(cfg: Config, now: float, line: str) -> None:
             f.write(f"{int(now)} {line}\n")
         lines = path.read_text().splitlines()
         if len(lines) > 2000:
-            atomic_write(path, ("\n".join(lines[-1000:]) + "\n").encode(),
-                         mode=0o644)
+            atomic_write(path, ("\n".join(lines[-1000:]) + "\n").encode(), mode=0o644)
     except OSError:
         pass
 
 
 # ------------------------------------------------- pool install / harvest ---
+
 
 def install_creds(cfg: Config, account: Account, out=print) -> str:
     """Copy the account's credentials into the pool and stamp its identity
@@ -435,8 +459,9 @@ def install_creds(cfg: Config, account: Account, out=print) -> str:
     if oauth_account:
         pool_meta = read_json(pool_meta_path)
         pool_meta["oauthAccount"] = oauth_account
-        atomic_write(pool_meta_path, json.dumps(pool_meta, indent=2).encode(),
-                     mode=0o644)
+        atomic_write(
+            pool_meta_path, json.dumps(pool_meta, indent=2).encode(), mode=0o644
+        )
     return sha
 
 
@@ -454,16 +479,18 @@ def bootstrap_pool(cfg: Config, source: Account, out=print) -> None:
             src.mkdir(parents=True, exist_ok=True)
         if src.exists():
             dst.symlink_to(src.resolve())
-    for src, dst in ((meta_path(source.home), cfg.pool / ".claude.json"),
-                     (source.home / "settings.json",
-                      cfg.pool / "settings.json")):
+    for src, dst in (
+        (meta_path(source.home), cfg.pool / ".claude.json"),
+        (source.home / "settings.json", cfg.pool / "settings.json"),
+    ):
         if src.is_file() and not dst.exists():
             atomic_write(dst, src.read_bytes(), mode=0o644)
     out(f"agent-balance: bootstrapped pool {cfg.pool} from {source.name}")
 
 
-def harvest(cfg: Config, accounts: list[Account], state: dict, now: float,
-            out=print) -> dict:
+def harvest(
+    cfg: Config, accounts: list[Account], state: dict, now: float, out=print
+) -> dict:
     """Reconcile the pool with the canonical account dirs before deciding
     anything. Two passes:
 
@@ -490,15 +517,16 @@ def harvest(cfg: Config, accounts: list[Account], state: dict, now: float,
         else:
             owner = by_email(accounts, pool_email)
             if owner is not None:
-                out(f"agent-balance: adopting /login of {owner.name} "
-                    f"({pool_email})")
+                out(f"agent-balance: adopting /login of {owner.name} ({pool_email})")
                 state["installed"] = owner.name
                 state["last_swap_epoch"] = int(now)
             else:
                 if state["installed"] != "unknown" or not state["blob_sha256"]:
-                    out("agent-balance: pool credentials belong to an "
+                    out(
+                        "agent-balance: pool credentials belong to an "
                         f"unrecognized account ({pool_email or 'no email'}); "
-                        "they will be replaced on the next swap")
+                        "they will be replaced on the next swap"
+                    )
                 state["installed"] = "unknown"
         state["blob_sha256"] = pool_sha
         write_state(cfg, state)
@@ -509,17 +537,22 @@ def harvest(cfg: Config, accounts: list[Account], state: dict, now: float,
         home_exp = blob_expires(installed.creds)
         if pool_exp > home_exp:
             copy_creds(pool_creds, installed.creds)
-            out(f"agent-balance: harvested refreshed token of "
-                f"{installed.name} back home")
+            out(
+                f"agent-balance: harvested refreshed token of "
+                f"{installed.name} back home"
+            )
         elif home_exp > pool_exp:
             state["blob_sha256"] = copy_creds(installed.creds, pool_creds)
             write_state(cfg, state)
-            out(f"agent-balance: refreshed pool copy of {installed.name} "
-                "from its home dir")
+            out(
+                f"agent-balance: refreshed pool copy of {installed.name} "
+                "from its home dir"
+            )
     return state
 
 
 # ------------------------------------------------------------------ tick ---
+
 
 class BalancerLock:
     def __init__(self, cfg: Config, wait: float = 0.0):
@@ -566,15 +599,22 @@ def pull_due(cfg: Config, now: float) -> bool:
     return True
 
 
-def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
-         out=print, lock_wait: float = 0.0) -> int:
+def tick(
+    cfg: Config,
+    now: float | None = None,
+    fetcher=fetch_usage,
+    out=print,
+    lock_wait: float = 0.0,
+) -> int:
     """One idempotent balance pass. Never raises for operational
     conditions — every outcome is one printed line."""
     now = time.time() if now is None else now
     accounts = discover_accounts(cfg)
     if not accounts:
-        out("agent-balance: no logged-in Anthropic accounts found "
-            f"(~/.claude or {cfg.root}/<name>/)")
+        out(
+            "agent-balance: no logged-in Anthropic accounts found "
+            f"(~/.claude or {cfg.root}/<name>/)"
+        )
         return 0
 
     with BalancerLock(cfg, wait=lock_wait) as held:
@@ -595,8 +635,10 @@ def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
             if st in ("expired", "nologin"):
                 need, reason = "hard", f"installed token {st}"
             elif st in ("limited", "error"):
-                out(f"agent-balance: usage probe of {installed.name} is "
-                    f"{st}; not swapping blind")
+                out(
+                    f"agent-balance: usage probe of {installed.name} is "
+                    f"{st}; not swapping blind"
+                )
                 return 0
             else:
                 five_now = normalized(st, now).five
@@ -611,16 +653,24 @@ def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
                     reason = f"5h at {five_now:.0f}% >= {cfg.threshold:.0f}"
                 elif five_now + rate * lookahead >= 100:
                     need = "soft"
-                    reason = (f"5h at {five_now:.0f}% burning "
-                              f"{rate * 60:.1f}%/min — projected past 100% "
-                              f"within {lookahead}s")
+                    reason = (
+                        f"5h at {five_now:.0f}% burning "
+                        f"{rate * 60:.1f}%/min — projected past 100% "
+                        f"within {lookahead}s"
+                    )
 
         # Deadline pull: even when the installed account is fine, rotate
         # toward an account whose weekly window expires soon with serious
         # allowance unused — sessions don't notice, and that allowance is
         # gone at the reset.
         stats = pulled = None
-        if need is None and cfg.pull_hours > 0 and pull_due(cfg, now):
+        if (
+            need is None
+            and installed is not None
+            and isinstance(st, Usage)
+            and cfg.pull_hours > 0
+            and pull_due(cfg, now)
+        ):
             st_n = normalized(st, now)
             installed_pace = weekly_pace(st_n, installed.capacity, now)
             stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
@@ -642,16 +692,21 @@ def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
             if best is not None and best[1] <= installed_pace - cfg.pull_margin:
                 pulled, _, ua = best
                 need = "soft"
-                reason = (f"deadline pull: {pulled.name} has "
-                          f"{100 - ua.seven:.0f}% of its week unused, "
-                          f"{(ua.r7 - now) / 3600:.0f}h until reset")
+                reason = (
+                    f"deadline pull: {pulled.name} has "
+                    f"{100 - ua.seven:.0f}% of its week unused, "
+                    f"{(ua.r7 - now) / 3600:.0f}h until reset"
+                )
 
         if need is None:
+            assert installed is not None  # need would be "hard" otherwise
             out(f"agent-balance: {installed.name} at {five_now:.0f}% 5h — ok")
             return 0
         if need == "soft" and now - state["last_swap_epoch"] < cfg.min_gap:
-            out(f"agent-balance: swap due ({reason}) but inside the "
-                f"{cfg.min_gap}s gap since the last one")
+            out(
+                f"agent-balance: swap due ({reason}) but inside the "
+                f"{cfg.min_gap}s gap since the last one"
+            )
             return 0
 
         if stats is None:
@@ -662,27 +717,30 @@ def tick(cfg: Config, now: float | None = None, fetcher=fetch_usage,
             exclude = installed.name if installed is not None else None
             target, feasible = pick_target(accounts, stats, exclude, now, cfg)
         if target is None or not feasible:
-            out(f"agent-balance: swap due ({reason}) but no other account "
-                "is feasible; leaving credentials in place")
+            out(
+                f"agent-balance: swap due ({reason}) but no other account "
+                "is feasible; leaving credentials in place"
+            )
             return 0
 
         if not cfg.pool.is_dir():
             bootstrap_pool(cfg, target, out)
         sha = install_creds(cfg, target, out)
         prev = state["installed"]
-        state.update(installed=target.name, blob_sha256=sha,
-                     last_swap_epoch=int(now))
+        state.update(installed=target.name, blob_sha256=sha, last_swap_epoch=int(now))
         write_state(cfg, state)
         log_swap(cfg, now, f"SWAP {prev} {target.name} {five_now:.0f} {reason}")
         u = stats.get(target.name)
-        pct = f" — 5h {u.five:.0f}%, 7d {u.seven:.0f}%" \
-            if isinstance(u, Usage) else ""
-        out(f"agent-balance: swapped {prev} -> {target.name} "
-            f"({target.email}){pct} [{reason}]")
+        pct = f" — 5h {u.five:.0f}%, 7d {u.seven:.0f}%" if isinstance(u, Usage) else ""
+        out(
+            f"agent-balance: swapped {prev} -> {target.name} "
+            f"({target.email}){pct} [{reason}]"
+        )
         return 0
 
 
 # ------------------------------------------------------------- commands ---
+
 
 def cmd_status(cfg: Config) -> int:
     now = time.time()
@@ -706,16 +764,20 @@ def cmd_status(cfg: Config) -> int:
         st = probe(a, cfg, now)
         mark = " <- installed" if a.name == state["installed"] else ""
         if isinstance(st, Usage):
-            print(f"  {a.name:<12} {a.email:<32} "
-                  f"5h {st.five:3.0f}% ({reset_in(st.r5)})  "
-                  f"7d {st.seven:3.0f}% ({reset_in(st.r7)}){mark}")
+            print(
+                f"  {a.name:<12} {a.email:<32} "
+                f"5h {st.five:3.0f}% ({reset_in(st.r5)})  "
+                f"7d {st.seven:3.0f}% ({reset_in(st.r7)}){mark}"
+            )
         else:
             print(f"  {a.name:<12} {a.email:<32} {st}{mark}")
     if not accounts:
         print("  (none logged in)")
 
-    print(f"\npool: {cfg.pool} "
-          f"({'exists' if cfg.pool.is_dir() else 'not bootstrapped yet'})")
+    print(
+        f"\npool: {cfg.pool} "
+        f"({'exists' if cfg.pool.is_dir() else 'not bootstrapped yet'})"
+    )
     print(f"installed: {state['installed']}", end="")
     if state["last_swap_epoch"]:
         mins = int((now - state["last_swap_epoch"]) / 60)
@@ -727,7 +789,10 @@ def cmd_status(cfg: Config) -> int:
     try:
         r = subprocess.run(
             ["systemctl", "--user", "is-active", "agent-balance.timer"],
-            capture_output=True, text=True, timeout=5)
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         timer = r.stdout.strip() or "inactive"
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -744,8 +809,10 @@ def cmd_status(cfg: Config) -> int:
 
 
 def cmd_watch(cfg: Config) -> int:
-    print(f"agent-balance: watching every {cfg.interval}s "
-          f"(threshold {cfg.threshold:.0f}%, ctrl-c to stop)")
+    print(
+        f"agent-balance: watching every {cfg.interval}s "
+        f"(threshold {cfg.threshold:.0f}%, ctrl-c to stop)"
+    )
     try:
         while True:
             tick(cfg)
@@ -763,18 +830,25 @@ def cmd_install(cfg: Config) -> int:
     cmd = str(exe) if os.access(exe, os.X_OK) else f"{sys.executable} {exe}"
     env_lines = "".join(
         f"Environment={key}={os.environ[key]}\n"
-        for key in ("AGENT_PICK_ROOT", "CLAUDE_ACCOUNTS_ROOT",
-                    "AGENT_BALANCE_THRESHOLD", "AGENT_BALANCE_MIN_GAP",
-                    "AGENT_BALANCE_DRAW", "AGENT_BALANCE_PULL_HOURS",
-                    "AGENT_BALANCE_PULL_MARGIN")
-        if os.environ.get(key))
+        for key in (
+            "AGENT_PICK_ROOT",
+            "CLAUDE_ACCOUNTS_ROOT",
+            "AGENT_BALANCE_THRESHOLD",
+            "AGENT_BALANCE_MIN_GAP",
+            "AGENT_BALANCE_DRAW",
+            "AGENT_BALANCE_PULL_HOURS",
+            "AGENT_BALANCE_PULL_MARGIN",
+        )
+        if os.environ.get(key)
+    )
     service = (
         "[Unit]\n"
         "Description=agent-balance account balancer tick\n\n"
         "[Service]\n"
         "Type=oneshot\n"
         f"{env_lines}"
-        f"ExecStart={cmd} tick\n")
+        f"ExecStart={cmd} tick\n"
+    )
     timer = (
         "[Unit]\n"
         "Description=agent-balance every minute\n\n"
@@ -783,7 +857,8 @@ def cmd_install(cfg: Config) -> int:
         f"OnUnitActiveSec={cfg.interval}\n"
         "AccuracySec=5\n\n"
         "[Install]\n"
-        "WantedBy=timers.target\n")
+        "WantedBy=timers.target\n"
+    )
 
     d = unit_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -791,25 +866,32 @@ def cmd_install(cfg: Config) -> int:
     (d / "agent-balance.timer").write_text(timer)
     try:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "--user", "enable", "--now",
-                        "agent-balance.timer"], check=True)
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", "agent-balance.timer"],
+            check=True,
+        )
     except (OSError, subprocess.CalledProcessError):
-        print("agent-balance: systemd user units written but could not be "
-              "enabled (no systemd user session?).")
+        print(
+            "agent-balance: systemd user units written but could not be "
+            "enabled (no systemd user session?)."
+        )
         print("Run the balancer another way:")
         print("  agent-balance watch                       # foreground loop")
         print(f"  * * * * * {cmd} tick                     # crontab line")
         return 0
-    print("agent-balance: timer enabled — ticking every "
-          f"{cfg.interval}s. Watch it with:")
+    print(
+        f"agent-balance: timer enabled — ticking every {cfg.interval}s. Watch it with:"
+    )
     print("  journalctl --user -u agent-balance -f")
     return 0
 
 
 def cmd_uninstall(cfg: Config) -> int:
     try:
-        subprocess.run(["systemctl", "--user", "disable", "--now",
-                        "agent-balance.timer"], capture_output=True)
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", "agent-balance.timer"],
+            capture_output=True,
+        )
     except OSError:
         pass
     removed = False
@@ -820,14 +902,20 @@ def cmd_uninstall(cfg: Config) -> int:
             removed = True
     if removed:
         try:
-            subprocess.run(["systemctl", "--user", "daemon-reload"],
-                           capture_output=True)
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"], capture_output=True
+            )
         except OSError:
             pass
-    print("agent-balance: timer removed." if removed
-          else "agent-balance: no units were installed.")
-    print(f"The pool dir remains at {cfg.pool} — running sessions keep "
-          "using whatever is installed there.")
+    print(
+        "agent-balance: timer removed."
+        if removed
+        else "agent-balance: no units were installed."
+    )
+    print(
+        f"The pool dir remains at {cfg.pool} — running sessions keep "
+        "using whatever is installed there."
+    )
     print(f"Delete it once they are done:  rm -rf {cfg.pool}")
     return 0
 
@@ -835,8 +923,11 @@ def cmd_uninstall(cfg: Config) -> int:
 def cmd_launch(cfg: Config, args: list[str]) -> int:
     tick(cfg, lock_wait=15)
     if not (cfg.pool / ".credentials.json").is_file():
-        print("agent-balance: pool has no credentials (no feasible account?)"
-              " — run 'agent-balance status'", file=sys.stderr)
+        print(
+            "agent-balance: pool has no credentials (no feasible account?)"
+            " — run 'agent-balance status'",
+            file=sys.stderr,
+        )
         return 1
     env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg.pool))
     try:
@@ -850,25 +941,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agent-balance",
         description="Swap Claude accounts beneath running sessions before "
-                    "they hit the 5-hour limit.")
-    parser.add_argument("--version", action="version",
-                        version=f"agent-balance {VERSION}")
+        "they hit the 5-hour limit.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"agent-balance {VERSION}"
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("status", help="accounts, installed creds, timer health")
     sub.add_parser("tick", help="one idempotent balance pass")
     sub.add_parser("watch", help="foreground tick loop")
     sub.add_parser("install", help="enable the systemd user timer")
     sub.add_parser("uninstall", help="remove the systemd user timer")
-    launch = sub.add_parser("launch",
-                            help="tick, then exec claude on the pool")
+    launch = sub.add_parser("launch", help="tick, then exec claude on the pool")
     launch.add_argument("claude_args", nargs=argparse.REMAINDER)
 
     ns = parser.parse_args(argv)
     cfg = make_config()
-    if sys.platform == "darwin" and ns.command in ("tick", "watch",
-                                                   "install", "launch"):
-        print("agent-balance: macOS stores Claude credentials in the "
-              "Keychain; hot-swapping is Linux-only for now", file=sys.stderr)
+    if sys.platform == "darwin" and ns.command in (
+        "tick",
+        "watch",
+        "install",
+        "launch",
+    ):
+        print(
+            "agent-balance: macOS stores Claude credentials in the "
+            "Keychain; hot-swapping is Linux-only for now",
+            file=sys.stderr,
+        )
         return 1
 
     if ns.command in (None, "status"):

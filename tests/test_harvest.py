@@ -2,27 +2,39 @@
 
 import json
 
-import agent_balance as ab
 from conftest import NOW, add_account
+
+import agent_balance as ab
 
 
 def setup_pool(cfg, account, email=None):
     """Pool holding a copy of the account's creds, with matching state."""
     cfg.pool.mkdir(parents=True)
     sha = ab.copy_creds(account.creds, cfg.pool / ".credentials.json")
-    (cfg.pool / ".claude.json").write_text(json.dumps({
-        "oauthAccount": {"emailAddress": email or account.email}}))
-    state = {"installed": account.name, "blob_sha256": sha,
-             "last_swap_epoch": NOW - 3600}
+    (cfg.pool / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": email or account.email}})
+    )
+    state = {
+        "installed": account.name,
+        "blob_sha256": sha,
+        "last_swap_epoch": NOW - 3600,
+    }
     ab.write_state(cfg, state)
     return state
 
 
 def write_pool_blob(cfg, name, expires_ms):
-    (cfg.pool / ".credentials.json").write_text(json.dumps({
-        "claudeAiOauth": {"accessToken": f"tok-{name}-refreshed",
-                          "refreshToken": f"ref-{name}-rotated",
-                          "expiresAt": expires_ms}}))
+    (cfg.pool / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": f"tok-{name}-refreshed",
+                    "refreshToken": f"ref-{name}-rotated",
+                    "expiresAt": expires_ms,
+                }
+            }
+        )
+    )
 
 
 def test_refreshed_pool_blob_harvested_home(cfg):
@@ -48,12 +60,18 @@ def test_stale_pool_loses_to_newer_home(cfg):
     accts = ab.discover_accounts(cfg)
     state = setup_pool(cfg, accts[0])
     # The account was used directly and refreshed at home.
-    (cfg.root / "alt1" / ".credentials.json").write_text(json.dumps({
-        "claudeAiOauth": {"accessToken": "tok-alt1-newer",
-                          "expiresAt": (NOW + 12 * 3600) * 1000}}))
+    (cfg.root / "alt1" / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "tok-alt1-newer",
+                    "expiresAt": (NOW + 12 * 3600) * 1000,
+                }
+            }
+        )
+    )
 
-    state = ab.harvest(cfg, accts, ab.read_state(cfg, NOW), NOW,
-                       lambda *_: None)
+    state = ab.harvest(cfg, accts, ab.read_state(cfg, NOW), NOW, lambda *_: None)
 
     pool = (cfg.pool / ".credentials.json").read_bytes()
     home = (cfg.root / "alt1" / ".credentials.json").read_bytes()
@@ -69,8 +87,9 @@ def test_manual_login_to_known_account_adopted(cfg):
     # The user ran /login in a pool session and picked alt2: Claude rewrote
     # both the creds and the pool .claude.json email.
     write_pool_blob(cfg, "alt2", (NOW + 12 * 3600) * 1000)
-    (cfg.pool / ".claude.json").write_text(json.dumps({
-        "oauthAccount": {"emailAddress": "alt2@example.com"}}))
+    (cfg.pool / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "alt2@example.com"}})
+    )
 
     out = []
     state = ab.harvest(cfg, accts, state, NOW, out.append)
@@ -88,8 +107,9 @@ def test_unknown_email_warns_once_touches_nothing(cfg):
     state = setup_pool(cfg, accts[0])
     home_before = (cfg.root / "alt1" / ".credentials.json").read_bytes()
     write_pool_blob(cfg, "mystery", (NOW + 12 * 3600) * 1000)
-    (cfg.pool / ".claude.json").write_text(json.dumps({
-        "oauthAccount": {"emailAddress": "stranger@example.com"}}))
+    (cfg.pool / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "stranger@example.com"}})
+    )
 
     out = []
     state = ab.harvest(cfg, accts, state, NOW, out.append)

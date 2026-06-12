@@ -3,13 +3,14 @@ allowance unused, even while the installed account is fine."""
 
 import dataclasses
 
-import agent_balance as ab
 from conftest import NOW, add_account, make_fetcher, usage
-from test_tick import setup_installed, H2, HD
+from test_tick import H2, setup_installed
 
-D4 = NOW + 4 * 86400        # installed week: 4 days out (~43% elapsed)
-H12 = NOW + 12 * 3600       # candidate week: 12h until reset (~93% elapsed)
-D3 = NOW + 3 * 86400        # too far for a 24h pull window
+import agent_balance as ab
+
+D4 = NOW + 4 * 86400  # installed week: 4 days out (~43% elapsed)
+H12 = NOW + 12 * 3600  # candidate week: 12h until reset (~93% elapsed)
+D3 = NOW + 3 * 86400  # too far for a 24h pull window
 
 
 def pull_cfg(cfg):
@@ -31,10 +32,13 @@ def test_pull_rotates_to_expiring_week(cfg):
 
     # alt1 fine (30% 5h, on pace); alt2 has 80% of its week unused with
     # 12h left -> pace ~-73 vs alt1's ~-13: well past the 20-point margin.
-    rc, out = run(cfg, {
-        "tok-alt1": usage(30, 30, H2, D4),
-        "tok-alt2": usage(10, 20, H2, H12),
-    })
+    rc, out = run(
+        cfg,
+        {
+            "tok-alt1": usage(30, 30, H2, D4),
+            "tok-alt2": usage(10, 20, H2, H12),
+        },
+    )
 
     assert ab.read_state(cfg, NOW)["installed"] == "alt2"
     assert any("deadline pull" in line for line in out)
@@ -47,10 +51,13 @@ def test_no_pull_when_reset_is_far(cfg):
     accts = ab.discover_accounts(cfg)
     setup_installed(cfg, ab.by_name(accts, "alt1"))
 
-    rc, out = run(cfg, {
-        "tok-alt1": usage(30, 30, H2, D4),
-        "tok-alt2": usage(10, 5, H2, D3),   # huge headroom, but 3 days out
-    })
+    rc, out = run(
+        cfg,
+        {
+            "tok-alt1": usage(30, 30, H2, D4),
+            "tok-alt2": usage(10, 5, H2, D3),  # huge headroom, but 3 days out
+        },
+    )
 
     assert ab.read_state(cfg, NOW)["installed"] == "alt1"
     assert any("ok" in line for line in out)
@@ -65,10 +72,13 @@ def test_no_pull_inside_margin(cfg):
 
     # alt2's week expires soon but is nearly spent: pace -8 vs alt1's -13
     # does not clear a 20-point margin.
-    rc, out = run(cfg, {
-        "tok-alt1": usage(30, 30, H2, D4),
-        "tok-alt2": usage(10, 85, H2, H12),
-    })
+    rc, out = run(
+        cfg,
+        {
+            "tok-alt1": usage(30, 30, H2, D4),
+            "tok-alt2": usage(10, 85, H2, H12),
+        },
+    )
 
     assert ab.read_state(cfg, NOW)["installed"] == "alt1"
 

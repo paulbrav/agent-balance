@@ -29,32 +29,43 @@ def cfg(tmp_path, monkeypatch):
     )
 
 
-def add_account(cfg, name, email=None, expires_ms=(NOW + 6 * 3600) * 1000,
-                capacity=None):
+def add_account(
+    cfg, name, email=None, expires_ms=(NOW + 6 * 3600) * 1000, capacity=None
+):
     """A logged-in Anthropic account dir with a distinctive token."""
     home = cfg.root / name
     home.mkdir(parents=True, exist_ok=True)
-    (home / ".credentials.json").write_text(json.dumps({
-        "claudeAiOauth": {
-            "accessToken": f"tok-{name}",
-            "refreshToken": f"ref-{name}",
-            "expiresAt": expires_ms,
-        }}))
-    (home / ".claude.json").write_text(json.dumps({
-        "oauthAccount": {"emailAddress": email or f"{name}@example.com"},
-        "hasCompletedOnboarding": True,
-    }))
+    (home / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": f"tok-{name}",
+                    "refreshToken": f"ref-{name}",
+                    "expiresAt": expires_ms,
+                }
+            }
+        )
+    )
+    (home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "oauthAccount": {"emailAddress": email or f"{name}@example.com"},
+                "hasCompletedOnboarding": True,
+            }
+        )
+    )
     if capacity is not None:
-        (home / "agent-pick.json").write_text(
-            json.dumps({"capacity": capacity}))
+        (home / "agent-pick.json").write_text(json.dumps({"capacity": capacity}))
     return home
 
 
 def make_fetcher(table):
     """Map token -> Usage | status word; unmapped tokens error loudly."""
+
     def fetcher(token):
         assert token in table, f"unexpected probe for token {token}"
         return table[token]
+
     return fetcher
 
 

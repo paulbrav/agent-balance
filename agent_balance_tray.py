@@ -41,6 +41,7 @@ def load_agent_balance():
     out of the repo, else from the installed `agent-balance` script."""
     try:
         import agent_balance
+
         return agent_balance
     except ImportError:
         pass
@@ -50,8 +51,7 @@ def load_agent_balance():
         candidates.append(Path(installed))
     for cand in candidates:
         if cand.is_file():
-            loader = importlib.machinery.SourceFileLoader(
-                "agent_balance", str(cand))
+            loader = importlib.machinery.SourceFileLoader("agent_balance", str(cand))
             spec = importlib.util.spec_from_loader("agent_balance", loader)
             mod = importlib.util.module_from_spec(spec)
             # Register BEFORE exec: dataclass creation resolves the module
@@ -59,8 +59,10 @@ def load_agent_balance():
             sys.modules["agent_balance"] = mod
             loader.exec_module(mod)
             return mod
-    sys.exit("agent-balance-tray: agent_balance.py not found "
-             "(install agent-balance or run from the repo)")
+    sys.exit(
+        "agent-balance-tray: agent_balance.py not found "
+        "(install agent-balance or run from the repo)"
+    )
 
 
 ab = load_agent_balance()
@@ -77,8 +79,10 @@ def bar_markup(pct: float) -> str:
         filled = 1
     filled = min(filled, 10)
     color = GREEN if p < 50 else YELLOW if p < 80 else RED
-    return (f'<span foreground="{color}">{BAR_ON * filled}'
-            f'{BAR_OFF * (10 - filled)} {p:3d}%</span>')
+    return (
+        f'<span foreground="{color}">{BAR_ON * filled}'
+        f"{BAR_OFF * (10 - filled)} {p:3d}%</span>"
+    )
 
 
 def reset_in(epoch: int, now: float) -> str:
@@ -101,16 +105,19 @@ def collect():
     state = ab.read_state(cfg, now)
     rows = []
     for a in ab.discover_accounts(cfg):
-        rows.append((a.name, a.email, ab.probe(a, cfg, now),
-                     a.name == state["installed"]))
+        rows.append(
+            (a.name, a.email, ab.probe(a, cfg, now), a.name == state["installed"])
+        )
     return cfg, now, state, rows
 
 
 class Tray:
     def __init__(self):
         self.indicator = AppIndicator.Indicator.new(
-            "agent-balance", "utilities-system-monitor-symbolic",
-            AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+            "agent-balance",
+            "utilities-system-monitor-symbolic",
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+        )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_menu(self.build_menu(None, 0, None, []))
         self.refresh()
@@ -132,8 +139,7 @@ class Tray:
         cfg, now, state, rows = data
         installed = next((r for r in rows if r[3]), None)
         if installed and isinstance(installed[2], ab.Usage):
-            self.indicator.set_label(
-                f" {installed[0]} {installed[2].five:.0f}%", "")
+            self.indicator.set_label(f" {installed[0]} {installed[2].five:.0f}%", "")
         elif state is not None:
             self.indicator.set_label(f" {state['installed']}", "")
         self.indicator.set_menu(self.build_menu(cfg, now, state, rows))
@@ -151,14 +157,18 @@ class Tray:
         menu.append(self.row_item("<b>CLAUDE</b>"))
         for name, email, st, is_installed in rows:
             if isinstance(st, ab.Usage):
-                cells = (f"{esc(name):<9} {esc(email):<30} "
-                         f"{bar_markup(st.five)}"
-                         f"<span foreground='{DIM}'> {reset_in(st.r5, now):<4}</span>"
-                         f"{bar_markup(st.seven)}"
-                         f"<span foreground='{DIM}'> {reset_in(st.r7, now):<3}</span>")
+                cells = (
+                    f"{esc(name):<9} {esc(email):<30} "
+                    f"{bar_markup(st.five)}"
+                    f"<span foreground='{DIM}'> {reset_in(st.r5, now):<4}</span>"
+                    f"{bar_markup(st.seven)}"
+                    f"<span foreground='{DIM}'> {reset_in(st.r7, now):<3}</span>"
+                )
             else:
-                cells = (f"{esc(name):<9} {esc(email):<30} "
-                         f"<span foreground='{DIM}'>{esc(str(st))}</span>")
+                cells = (
+                    f"{esc(name):<9} {esc(email):<30} "
+                    f"<span foreground='{DIM}'>{esc(str(st))}</span>"
+                )
             if is_installed:
                 cells += f" <span foreground='{GREEN}'>◀ installed</span>"
             menu.append(self.row_item(cells))
@@ -186,6 +196,7 @@ class Tray:
             else:
                 ab.tick(ab.make_config(), out=lambda *_: None)
             self.refresh()
+
         threading.Thread(target=run, daemon=True).start()
 
 
@@ -199,9 +210,12 @@ def install_autostart() -> int:
         "Name=agent-balance tray\n"
         "Comment=Claude account usage in the tray\n"
         f"Exec={exe}\n"
-        "X-GNOME-Autostart-enabled=true\n")
-    print(f"agent-balance-tray: autostart installed — starts at next login; "
-          f"start it now with: {exe} &")
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+    print(
+        f"agent-balance-tray: autostart installed — starts at next login; "
+        f"start it now with: {exe} &"
+    )
     return 0
 
 

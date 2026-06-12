@@ -163,11 +163,20 @@ turns for garbage (next turn fails `401`) and for a second valid account
 (next turn succeeds on the other account). Details, the tick algorithm, and
 troubleshooting live in [docs/balancing.md](docs/balancing.md).
 
-## Tests
+## Development
+
+Tooling is managed with [uv](https://docs.astral.sh/uv/) — `pyproject.toml`
+carries the metadata and the dev toolchain (pytest, ruff, ty). The *runtime*
+stays stdlib-only on purpose, so `install.sh` keeps working on any box with a
+system python, no venv required.
 
 ```bash
-pytest                          # unit tests, no network, no real accounts
-AGENT_BALANCE_LIVE=1 pytest tests/test_hotswap_live.py -v
+uv sync                         # .venv with the dev group
+uv run pytest                   # unit tests, no network, no real accounts
+uv run ruff check . && uv run ruff format --check .
+uv run ty check                 # type check (tray excluded: gi has no stubs)
+
+AGENT_BALANCE_LIVE=1 uv run pytest tests/test_hotswap_live.py -v
 # ^ end-to-end rehearsal: starts a real two-turn haiku session on a scratch
 #   pool and swaps accounts beneath it between the turns
 ```
