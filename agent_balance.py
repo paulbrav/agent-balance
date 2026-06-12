@@ -344,7 +344,7 @@ def throttle_fetch(cfg: Config) -> None:
         pass
 
 
-def probe(account: Account, cfg: Config, now: float, fetcher=fetch_usage):
+def probe(account: Account, cfg: Config, now: float, fetcher=None):
     """Usage for one account, or a status word: nologin | expired |
     limited | error. Cache-first; staggered real fetches; on a
     rate-limited endpoint, falls back to the last known numbers (asof
@@ -370,9 +370,11 @@ def probe(account: Account, cfg: Config, now: float, fetcher=fetch_usage):
     except (OSError, ValueError):
         pass
 
-    if fetcher is fetch_usage:  # throttle only the real network path
+    if fetcher is None:  # only the real network path is throttled
         throttle_fetch(cfg)
-    result = fetcher(creds.token)
+        result = fetch_usage(creds.token)
+    else:
+        result = fetcher(creds.token)
     if isinstance(result, Usage):
         result.asof = now
         cache_put(cfg, account.name, result, now)
@@ -763,7 +765,7 @@ def pull_due(cfg: Config, now: float) -> bool:
 def tick(
     cfg: Config,
     now: float | None = None,
-    fetcher=fetch_usage,
+    fetcher=None,
     out=print,
     lock_wait: float = 0.0,
 ) -> int:
