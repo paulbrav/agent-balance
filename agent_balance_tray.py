@@ -23,7 +23,9 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import gi
 
@@ -85,31 +87,35 @@ def bar_markup(pct: float) -> str:
     )
 
 
-def reset_in(epoch: int, now: float) -> str:
-    s = epoch - now
-    if epoch == 0:
-        return "-"
-    if s <= 0:
-        return "now"
-    if s < 3600:
-        return f"{int(s // 60) + 1}m"
-    if s < 86400:
-        return f"{round(s / 3600)}h"
-    return f"{round(s / 86400)}d"
+class Row(NamedTuple):
+    name: str
+    email: str
+    view: object  # ab.Usage | status word
+    installed: bool
 
 
-def collect():
+@dataclass
+class Snapshot:
+    """One worker-thread collection pass, handed to the GTK thread."""
+
+    now: float = 0.0
+    installed_name: str = ""
+    rows: list[Row] = field(default_factory=list)
+    error: str | None = None  # collection blew up; rows are empty
+
+
+def collect() -> Snapshot:
     """Worker-thread data gathering. Cache-only (offline_view): the tray
     never fetches — the balancer tick is the machine's only steady poller,
     so the tray adds zero load to the rate-limited usage endpoint."""
     cfg = ab.make_config()
     now = time.time()
     state = ab.read_state(cfg, now)
-    rows = []
-    for a in ab.discover_accounts(cfg):
-        view = ab.offline_view(a, cfg, now)
-        rows.append((a.name, a.email, view, a.name == state["installed"]))
-    return cfg, now, state, rows
+    rows = [
+        Row(a.name, a.email, ab.offline_view(a, cfg, now), a.name == state["installed"])
+        for a in ab.discover_accounts(cfg)
+    ]
+    return Snapshot(now, state["installed"], rows)
 
 
 class Tray:
@@ -120,7 +126,7 @@ class Tray:
             AppIndicator.IndicatorCategory.APPLICATION_STATUS,
         )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-        self.indicator.set_menu(self.build_menu(None, 0, None, []))
+        self.indicator.set_menu(self.build_menu(Snapshot()))
         self.refresh()
         interval = max(int(ab.make_config().interval), 30)
         GLib.timeout_add_seconds(interval, self.refresh)
@@ -131,22 +137,22 @@ class Tray:
 
     def _work(self):
         try:
-            data = collect()
+            snap = collect()
         except Exception as e:  # never let a probe hiccup kill the tray
-            data = None, 0, None, [("error", str(e), "error", False)]
-        GLib.idle_add(self._update, data)
+            snap = Snapshot(error=str(e))
+        GLib.idle_add(self._update, snap)
 
-    def _update(self, data):
-        cfg, now, state, rows = data
-        installed = next((r for r in rows if r[3]), None)
-        if installed and isinstance(installed[2], ab.Usage):
-            # Identity is the email, not the directory name; the local
-            # part keeps the label short.
-            who = (installed[1] or installed[0]).split("@")[0]
-            self.indicator.set_label(f" {who} {installed[2].five:.0f}%", "")
-        elif state is not None:
-            self.indicator.set_label(f" {state['installed']}", "")
-        self.indicator.set_menu(self.build_menu(cfg, now, state, rows))
+    def _update(self, snap: Snapshot):
+        if snap.error is None:  # on a hiccup, keep the last good label
+            installed = next((r for r in snap.rows if r.installed), None)
+            if installed and isinstance(installed.view, ab.Usage):
+                # Identity is the email, not the directory name; the local
+                # part keeps the label short.
+                who = (installed.email or installed.name).split("@")[0]
+                self.indicator.set_label(f" {who} {installed.view.five:.0f}%", "")
+            else:
+                self.indicator.set_label(f" {snap.installed_name}", "")
+        self.indicator.set_menu(self.build_menu(snap))
         return False
 
     def row_item(self, markup: str) -> Gtk.MenuItem:
@@ -156,32 +162,39 @@ class Tray:
         item.add(label)
         return item
 
-    def build_menu(self, cfg, now, state, rows) -> Gtk.Menu:
+    def build_menu(self, snap: Snapshot) -> Gtk.Menu:
         menu = Gtk.Menu()
         menu.append(self.row_item("<b>CLAUDE</b>"))
-        for name, email, st, is_installed in rows:
-            who = email or name  # emails are the identity; dirs are plumbing
+        for row in snap.rows:
+            who = row.email or row.name  # emails are identity; dirs are plumbing
+            st = row.view
             if isinstance(st, ab.Usage):
                 age = ""
-                if st.asof and now - st.asof > 120:
+                if st.asof and snap.now - st.asof > ab.USAGE_STALE_AFTER:
                     age = (
                         f"<span foreground='{DIM}'>"
-                        f" · {(now - st.asof) / 60:.0f}m old</span>"
+                        f" · {(snap.now - st.asof) / 60:.0f}m old</span>"
                     )
+                r5 = ab.reset_in(st.r5, snap.now)
+                r7 = ab.reset_in(st.r7, snap.now)
                 cells = (
                     f"{esc(who):<32} "
                     f"{bar_markup(st.five)}"
-                    f"<span foreground='{DIM}'> {reset_in(st.r5, now):<4}</span>"
+                    f"<span foreground='{DIM}'> {r5:<4}</span>"
                     f"{bar_markup(st.seven)}"
-                    f"<span foreground='{DIM}'> {reset_in(st.r7, now):<3}</span>"
+                    f"<span foreground='{DIM}'> {r7:<3}</span>"
                     f"{age}"
                 )
             else:
                 cells = f"{esc(who):<32} <span foreground='{DIM}'>{esc(str(st))}</span>"
-            if is_installed:
+            if row.installed:
                 cells += f" <span foreground='{GREEN}'>◀ installed</span>"
             menu.append(self.row_item(cells))
-        if not rows:
+        if snap.error is not None:
+            menu.append(
+                self.row_item(f"<span foreground='{DIM}'>{esc(snap.error)}</span>")
+            )
+        elif not snap.rows:
             menu.append(self.row_item("no accounts found"))
 
         menu.append(Gtk.SeparatorMenuItem())
