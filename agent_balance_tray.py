@@ -140,7 +140,10 @@ class Tray:
         cfg, now, state, rows = data
         installed = next((r for r in rows if r[3]), None)
         if installed and isinstance(installed[2], ab.Usage):
-            self.indicator.set_label(f" {installed[0]} {installed[2].five:.0f}%", "")
+            # Identity is the email, not the directory name; the local
+            # part keeps the label short.
+            who = (installed[1] or installed[0]).split("@")[0]
+            self.indicator.set_label(f" {who} {installed[2].five:.0f}%", "")
         elif state is not None:
             self.indicator.set_label(f" {state['installed']}", "")
         self.indicator.set_menu(self.build_menu(cfg, now, state, rows))
@@ -157,19 +160,24 @@ class Tray:
         menu = Gtk.Menu()
         menu.append(self.row_item("<b>CLAUDE</b>"))
         for name, email, st, is_installed in rows:
+            who = email or name  # emails are the identity; dirs are plumbing
             if isinstance(st, ab.Usage):
+                age = ""
+                if st.asof and now - st.asof > 120:
+                    age = (
+                        f"<span foreground='{DIM}'>"
+                        f" · {(now - st.asof) / 60:.0f}m old</span>"
+                    )
                 cells = (
-                    f"{esc(name):<9} {esc(email):<30} "
+                    f"{esc(who):<32} "
                     f"{bar_markup(st.five)}"
                     f"<span foreground='{DIM}'> {reset_in(st.r5, now):<4}</span>"
                     f"{bar_markup(st.seven)}"
                     f"<span foreground='{DIM}'> {reset_in(st.r7, now):<3}</span>"
+                    f"{age}"
                 )
             else:
-                cells = (
-                    f"{esc(name):<9} {esc(email):<30} "
-                    f"<span foreground='{DIM}'>{esc(str(st))}</span>"
-                )
+                cells = f"{esc(who):<32} <span foreground='{DIM}'>{esc(str(st))}</span>"
             if is_installed:
                 cells += f" <span foreground='{GREEN}'>◀ installed</span>"
             menu.append(self.row_item(cells))
@@ -177,7 +185,7 @@ class Tray:
             menu.append(self.row_item("no accounts found"))
 
         menu.append(Gtk.SeparatorMenuItem())
-        tick = Gtk.MenuItem(label="Tick now")
+        tick = Gtk.MenuItem(label="Rebalance now")
         tick.connect("activate", self.on_tick)
         menu.append(tick)
         refresh = Gtk.MenuItem(label="Refresh")
