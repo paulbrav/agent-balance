@@ -88,6 +88,20 @@ agent-balance install        # write + enable the 60s systemd user timer
 No systemd user session? `agent-balance install` falls back to printing a
 crontab line, or run `agent-balance watch` in a tmux pane.
 
+**Then route `claude` through the pool (recommended).** Bare `claude` reads
+`~/.claude` — your unbalanced main account — until you point it at the pool.
+Add this to `~/.bashrc` (or `~/.zshrc`) and open a new terminal:
+
+```bash
+export CLAUDE_CONFIG_DIR="$HOME/.claude-accounts/.active"
+```
+
+From then on every `claude` runs on whichever account the balancer has
+installed, and gets hot-swapped beneath you before limits hit. Sessions that
+were already running on `~/.claude` keep their old account until relaunched.
+`agent-pick --use <name>` still pins a real account dir — agent-pick sets the
+variable itself, overriding the shell default.
+
 ## Use
 
 ```bash
@@ -98,14 +112,11 @@ agent-balance watch          # foreground loop (no systemd needed)
 agent-balance uninstall      # remove the timer; pool dir is left in place
 ```
 
-To make **every** `claude` invocation balanced, add to your shell rc:
-
-```bash
-export CLAUDE_CONFIG_DIR="$HOME/.claude-accounts/.active"
-```
-
-agent-pick keeps working unchanged: `agent-pick --use alt2` still pins a real
-account dir and bypasses the pool entirely.
+With the `CLAUDE_CONFIG_DIR` export from the Install section in place, bare
+`claude` is already balanced — `agent-balance launch` remains useful for
+one-off runs without the export. agent-pick keeps working unchanged:
+`agent-pick --use alt2` still pins a real account dir and bypasses the pool
+entirely.
 
 Tuning (env vars, also honored by the systemd unit if set at install time):
 
