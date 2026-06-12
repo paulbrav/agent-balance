@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_TTL = 45  # seconds a successful usage probe stays cached
 PACE_BAND = 5.0  # weekly paces within this many points count as tied
@@ -201,6 +201,7 @@ class Usage:
     seven: float  # 7d window utilization %
     r5: int  # 5h reset epoch (0 = unknown)
     r7: int  # 7d reset epoch (0 = unknown)
+    asof: float = 0.0  # epoch the numbers were fetched (0 = unknown/fresh)
 
 
 def parse_reset(value) -> int:
@@ -247,10 +248,32 @@ def cache_get(cfg: Config, name: str, now: float) -> Usage | None:
     entry = read_json(cfg.cache / name)
     try:
         if now - entry["epoch"] < USAGE_TTL:
-            return Usage(entry["five"], entry["seven"], entry["r5"], entry["r7"])
+            return Usage(
+                entry["five"],
+                entry["seven"],
+                entry["r5"],
+                entry["r7"],
+                asof=float(entry["epoch"]),
+            )
     except (KeyError, TypeError):
         pass
     return None
+
+
+def last_known(cfg: Config, name: str) -> Usage | None:
+    """The most recent successful probe regardless of age — the fallback
+    when the endpoint is rate-limiting. asof carries its timestamp."""
+    entry = read_json(cfg.cache / name)
+    try:
+        return Usage(
+            entry["five"],
+            entry["seven"],
+            entry["r5"],
+            entry["r7"],
+            asof=float(entry["epoch"]),
+        )
+    except (KeyError, TypeError):
+        return None
 
 
 def cache_put(cfg: Config, name: str, usage: Usage, now: float) -> None:
@@ -271,10 +294,34 @@ def cache_put(cfg: Config, name: str, usage: Usage, now: float) -> None:
         pass
 
 
+STALE_MAX = 900  # serve last-known numbers up to this old when rate-limited
+LIMITED_COOLDOWN = 120  # after a 429, don't re-fetch that account for this
+PROBE_SPACING = 2.5  # min seconds between real fetches — bursts trip the
+#                      per-IP limit faster than sustained rate does
+
+
+def throttle_fetch(cfg: Config) -> None:
+    """Global (cross-process, file-based) spacing between real endpoint
+    fetches, so fleet sweeps go out staggered instead of as a burst."""
+    marker = cfg.cache / "last-fetch"
+    try:
+        wait = PROBE_SPACING - (time.time() - float(marker.read_text()))
+        if 0 < wait <= PROBE_SPACING:
+            time.sleep(wait)
+    except (OSError, ValueError):
+        pass
+    try:
+        cfg.cache.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(time.time()))
+    except OSError:
+        pass
+
+
 def probe(account: Account, cfg: Config, now: float, fetcher=fetch_usage):
     """Usage for one account, or a status word: nologin | expired |
-    limited | error. Cache-first so ticks and status calls don't burst
-    the endpoint."""
+    limited | error. Cache-first; staggered real fetches; on a
+    rate-limited endpoint, falls back to the last known numbers (asof
+    marks their age) for up to STALE_MAX seconds."""
     oauth = read_json(account.creds).get("claudeAiOauth") or {}
     token = oauth.get("accessToken")
     if not token:
@@ -284,11 +331,52 @@ def probe(account: Account, cfg: Config, now: float, fetcher=fetch_usage):
     cached = cache_get(cfg, account.name, now)
     if cached is not None:
         return cached
+
+    def stale_or(word: str):
+        stale = last_known(cfg, account.name)
+        if stale is not None and now - stale.asof <= STALE_MAX:
+            return stale
+        return word
+
+    cooldown = cfg.cache / f"{account.name}.limited"
+    try:
+        if now - float(cooldown.read_text()) < LIMITED_COOLDOWN:
+            return stale_or("limited")
+    except (OSError, ValueError):
+        pass
+
+    if fetcher is fetch_usage:  # throttle only the real network path
+        throttle_fetch(cfg)
     result = fetcher(token)
     if isinstance(result, Usage):
+        result.asof = now
         cache_put(cfg, account.name, result, now)
         record_history(cfg, account.name, result, now)
-    return result
+        try:
+            cooldown.unlink()
+        except OSError:
+            pass
+        return result
+    if result == "limited":
+        try:
+            cfg.cache.mkdir(parents=True, exist_ok=True)
+            cooldown.write_text(str(now))
+        except OSError:
+            pass
+    return stale_or(result)
+
+
+def offline_view(account: Account, cfg: Config, now: float):
+    """Cache-only view for displays (the tray): Usage — possibly stale,
+    asof says how stale — or a status word. Never touches the network;
+    the balancer tick is the only steady fetcher on the machine."""
+    oauth = read_json(account.creds).get("claudeAiOauth") or {}
+    if not oauth.get("accessToken"):
+        return "nologin"
+    if (oauth.get("expiresAt") or 0) / 1000 <= now:
+        return "expired"
+    stale = last_known(cfg, account.name)
+    return stale if stale is not None else "no data yet"
 
 
 def record_history(cfg: Config, name: str, usage: Usage, now: float) -> None:
@@ -628,6 +716,7 @@ def tick(
 
         need = reason = None
         five_now = 0.0
+        est = ""
         if installed is None:
             need, reason = "hard", "no account installed"
         else:
@@ -645,18 +734,24 @@ def tick(
                 # Projection guard: a high threshold is only safe if a fast
                 # burn can't blow through the blind spot between probes —
                 # swap early when the recent slope says 100% lands within
-                # two tick intervals.
+                # two tick intervals. Stale numbers (rate-limited endpoint
+                # served last-known data) get extrapolated by the same slope
+                # first, so a blind spot doesn't freeze the picture.
                 rate = burn_rate(cfg, installed.name, now)
+                age = now - st.asof if st.asof else 0.0
+                if age > USAGE_TTL:
+                    five_now = min(five_now + rate * age, 100.0)
+                    est = f" (estimated from {age / 60:.0f}m-old data)"
                 lookahead = 2 * cfg.interval
                 if five_now >= cfg.threshold:
                     need = "soft"
-                    reason = f"5h at {five_now:.0f}% >= {cfg.threshold:.0f}"
+                    reason = f"5h at {five_now:.0f}%{est} >= {cfg.threshold:.0f}"
                 elif five_now + rate * lookahead >= 100:
                     need = "soft"
                     reason = (
                         f"5h at {five_now:.0f}% burning "
                         f"{rate * 60:.1f}%/min — projected past 100% "
-                        f"within {lookahead}s"
+                        f"within {lookahead}s{est}"
                     )
 
         # Deadline pull: even when the installed account is fine, rotate
@@ -700,7 +795,7 @@ def tick(
 
         if need is None:
             assert installed is not None  # need would be "hard" otherwise
-            out(f"agent-balance: {installed.name} at {five_now:.0f}% 5h — ok")
+            out(f"agent-balance: {installed.name} at {five_now:.0f}% 5h{est} — ok")
             return 0
         if need == "soft" and now - state["last_swap_epoch"] < cfg.min_gap:
             out(
@@ -764,10 +859,13 @@ def cmd_status(cfg: Config) -> int:
         st = probe(a, cfg, now)
         mark = " <- installed" if a.name == state["installed"] else ""
         if isinstance(st, Usage):
+            age = ""
+            if st.asof and now - st.asof > 2 * USAGE_TTL:
+                age = f" [{(now - st.asof) / 60:.0f}m old]"
             print(
                 f"  {a.name:<12} {a.email:<32} "
                 f"5h {st.five:3.0f}% ({reset_in(st.r5)})  "
-                f"7d {st.seven:3.0f}% ({reset_in(st.r7)}){mark}"
+                f"7d {st.seven:3.0f}% ({reset_in(st.r7)}){age}{mark}"
             )
         else:
             print(f"  {a.name:<12} {a.email:<32} {st}{mark}")

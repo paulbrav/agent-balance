@@ -99,15 +99,16 @@ def reset_in(epoch: int, now: float) -> str:
 
 
 def collect():
-    """Worker-thread data gathering: discovery + cache-first probes."""
+    """Worker-thread data gathering. Cache-only (offline_view): the tray
+    never fetches — the balancer tick is the machine's only steady poller,
+    so the tray adds zero load to the rate-limited usage endpoint."""
     cfg = ab.make_config()
     now = time.time()
     state = ab.read_state(cfg, now)
     rows = []
     for a in ab.discover_accounts(cfg):
-        rows.append(
-            (a.name, a.email, ab.probe(a, cfg, now), a.name == state["installed"])
-        )
+        view = ab.offline_view(a, cfg, now)
+        rows.append((a.name, a.email, view, a.name == state["installed"]))
     return cfg, now, state, rows
 
 

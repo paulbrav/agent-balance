@@ -1,6 +1,6 @@
 [project]
 name = "agent-balance"
-version = "0.1.0"
+version = "0.2.0"
 description = "Swap Claude accounts beneath running sessions before the 5-hour limit kills your workflow"
 readme = "README.md"
 license = "MIT"
