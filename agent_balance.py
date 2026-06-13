@@ -287,10 +287,20 @@ def fetch_usage(token: str):
     )
 
 
-def last_known(cfg: Config, name: str) -> Usage | None:
-    """The most recent successful probe regardless of age — the fallback
-    when the endpoint is rate-limiting. asof carries its timestamp."""
-    entry = read_json(cfg.cache / name)
+def usage_to_cache(u: Usage) -> dict:
+    """The on-disk cache shape of a Usage — the only place that knows it
+    (note the asof <-> epoch rename)."""
+    return {
+        "epoch": u.asof,
+        "five": u.five,
+        "seven": u.seven,
+        "r5": u.r5,
+        "r7": u.r7,
+    }
+
+
+def usage_from_cache(entry: dict) -> Usage | None:
+    """Inverse of usage_to_cache; None when a field is missing or malformed."""
     try:
         return Usage(
             entry["five"],
@@ -303,25 +313,17 @@ def last_known(cfg: Config, name: str) -> Usage | None:
         return None
 
 
-def cache_get(cfg: Config, name: str, now: float) -> Usage | None:
-    """last_known, but only while it is still within the probe TTL."""
-    u = last_known(cfg, name)
-    return u if u is not None and now - u.asof < USAGE_TTL else None
+def last_known(cfg: Config, name: str) -> Usage | None:
+    """The most recent successful probe regardless of age — the fallback
+    when the endpoint is rate-limiting. asof carries its timestamp."""
+    return usage_from_cache(read_json(cfg.cache / name))
 
 
 def cache_put(cfg: Config, name: str, usage: Usage) -> None:
     try:
         cfg.cache.mkdir(parents=True, exist_ok=True)
-        data = json.dumps(
-            {
-                "epoch": usage.asof,
-                "five": usage.five,
-                "seven": usage.seven,
-                "r5": usage.r5,
-                "r7": usage.r7,
-            }
-        )
-        atomic_write(cfg.cache / name, data.encode(), mode=0o644)
+        data = json.dumps(usage_to_cache(usage)).encode()
+        atomic_write(cfg.cache / name, data, mode=0o644)
     except OSError:
         pass
 
@@ -351,14 +353,13 @@ def probe(account: Account, cfg: Config, now: float, fetcher=None):
     word = cred_status(creds, now)
     if word is not None:
         return word
-    cached = cache_get(cfg, account.name, now)
-    if cached is not None:
-        return cached
+    prev = last_known(cfg, account.name)  # read the cache once, reuse below
+    if prev is not None and now - prev.asof < USAGE_TTL:
+        return prev  # still inside the probe TTL — a fresh-enough hit
 
     def stale_or(word: str):
-        stale = last_known(cfg, account.name)
-        if stale is not None and now - stale.asof <= STALE_MAX:
-            return stale
+        if prev is not None and now - prev.asof <= STALE_MAX:
+            return prev
         return word
 
     cooldown = cfg.cache / f"{account.name}.limited"
@@ -416,6 +417,13 @@ def burn_rate(cfg: Config, name: str, now: float, window: int = 900) -> float:
     if e1 - e0 < 60:
         return 0.0
     return max((f1 - f0) / (e1 - e0), 0.0)
+
+
+def probe_fleet(accounts: list[Account], cfg: Config, now: float, fetcher=None) -> dict:
+    """Probe every account once, keyed by name (values are Usage or a status
+    word). Cache-first, so real fetches stay staggered by throttle_fetch —
+    the whole-fleet sweep the rebalance pull and any swap both need."""
+    return {a.name: probe(a, cfg, now, fetcher) for a in accounts}
 
 
 # ------------------------------------------------------------ pick policy ---
@@ -621,6 +629,15 @@ def log_swap(cfg: Config, now: float, line: str) -> None:
     append_capped(cfg.cache / "swaps", f"{int(now)} {line}", 2000, 1000)
 
 
+def commit_swap(state: dict, installed: str, blob_sha: str, now: float) -> None:
+    """Record a completed swap into state, in place: clear any pending
+    journal, name the new installed account, stamp its blob and epoch. The
+    one shape both tick's happy path and harvest's crash-recovery write, so
+    the two can't drift. (Does not persist — the caller write_states.)"""
+    state.pop("pending", None)
+    state.update(installed=installed, blob_sha256=blob_sha, last_swap_epoch=int(now))
+
+
 # ------------------------------------------------- pool install / harvest ---
 
 
@@ -693,11 +710,8 @@ def harvest(
         pool_sha = sha256_file(pool_creds)
         if pool_sha == pending["src_sha"]:
             # The journaled copy landed before the crash: finish the commit.
-            state.update(
-                installed=pending["target"],
-                blob_sha256=pool_sha,
-                last_swap_epoch=int(now),
-            )
+            # pending was already popped above, so commit_swap's pop is a no-op.
+            commit_swap(state, pending["target"], pool_sha, now)
             out(f"agent-balance: finished interrupted swap to {pending['target']}")
         elif pool_sha != state["blob_sha256"]:
             # Neither the old blob nor the journaled one — someone else
@@ -831,6 +845,7 @@ def tick(
         need = reason = None
         five_now = 0.0
         est = ""
+        st = None  # the installed probe, or a status word; None when uninstalled
         if installed is None:
             need, reason = "hard", "no account installed"
         else:
@@ -881,7 +896,7 @@ def tick(
             and cfg.pull_margin > 0
             and pull_due(cfg, now)
         ):
-            stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
+            stats = probe_fleet(accounts, cfg, now, fetcher)
             pull = pick_pull_target(accounts, stats, installed, st, cfg, now)
             if pull is not None:
                 pulled, u_best, u_inst = pull
@@ -906,7 +921,7 @@ def tick(
             return 0
 
         if stats is None:
-            stats = {a.name: probe(a, cfg, now, fetcher) for a in accounts}
+            stats = probe_fleet(accounts, cfg, now, fetcher)
         if pulled is not None:
             target = pulled
         else:
@@ -931,8 +946,7 @@ def tick(
             bootstrap_pool(cfg, target, out)
         sha = install_creds(cfg, target)
         prev = state["installed"]
-        del state["pending"]
-        state.update(installed=target.name, blob_sha256=sha, last_swap_epoch=int(now))
+        commit_swap(state, target.name, sha, now)
         write_state(cfg, state)
         log_swap(cfg, now, f"SWAP {prev} {target.name} {five_now:.0f} {reason}")
         u = stats.get(target.name)
@@ -961,6 +975,15 @@ def reset_in(epoch: int, now: float) -> str:
     return f"{round(s / 86400)}d"
 
 
+def stale_age_min(u: Usage, now: float) -> float | None:
+    """Age of u in minutes, but only once it crosses the display-staleness
+    threshold; None when fresh (or asof unknown). The one place that decides
+    "show this as stale" — shared by cmd_status and the tray."""
+    if u.asof and now - u.asof > USAGE_STALE_AFTER:
+        return (now - u.asof) / 60
+    return None
+
+
 def cmd_status(cfg: Config) -> int:
     now = time.time()
     accounts = discover_accounts(cfg)
@@ -971,9 +994,8 @@ def cmd_status(cfg: Config) -> int:
         st = probe(a, cfg, now)
         mark = " <- installed" if a.name == state["installed"] else ""
         if isinstance(st, Usage):
-            age = ""
-            if st.asof and now - st.asof > USAGE_STALE_AFTER:
-                age = f" [{(now - st.asof) / 60:.0f}m old]"
+            stale = stale_age_min(st, now)
+            age = f" [{stale:.0f}m old]" if stale is not None else ""
             print(
                 f"  {a.name:<12} {a.email:<32} "
                 f"5h {st.five:3.0f}% ({reset_in(st.r5, now)})  "

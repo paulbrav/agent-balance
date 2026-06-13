@@ -169,12 +169,12 @@ class Tray:
             who = row.email or row.name  # emails are identity; dirs are plumbing
             st = row.view
             if isinstance(st, ab.Usage):
-                age = ""
-                if st.asof and snap.now - st.asof > ab.USAGE_STALE_AFTER:
-                    age = (
-                        f"<span foreground='{DIM}'>"
-                        f" · {(snap.now - st.asof) / 60:.0f}m old</span>"
-                    )
+                stale = ab.stale_age_min(st, snap.now)
+                age = (
+                    f"<span foreground='{DIM}'> · {stale:.0f}m old</span>"
+                    if stale is not None
+                    else ""
+                )
                 r5 = ab.reset_in(st.r5, snap.now)
                 r7 = ab.reset_in(st.r7, snap.now)
                 cells = (
