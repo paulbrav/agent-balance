@@ -36,11 +36,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple, NotRequired, TypedDict
 
 VERSION = "0.3.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -224,7 +224,7 @@ def read_oauth(path: Path) -> OauthCreds:
     )
 
 
-def cred_status(creds: OauthCreds, now: float) -> str | None:
+def cred_status(creds: OauthCreds, now: float) -> Literal["nologin", "expired"] | None:
     """'nologin' / 'expired' when the credentials can't be probed, None
     when they look usable. A missing or malformed expiresAt counts as
     expired (the field is milliseconds; the conversion lives only here)."""
@@ -247,6 +247,9 @@ class Usage:
     asof: float = 0.0  # epoch the numbers were fetched (0 = unknown/fresh)
 
 
+ProbeResult = Usage | Literal["nologin", "expired", "limited", "error"]
+
+
 def parse_reset(value) -> int:
     if isinstance(value, (int, float)):
         return int(value)
@@ -258,7 +261,7 @@ def parse_reset(value) -> int:
     return 0
 
 
-def fetch_usage(token: str):
+def fetch_usage(token: str) -> Usage | Literal["limited", "error"]:
     """One GET against the OAuth usage endpoint -> Usage or a status word
     ('limited' on 429, 'error' otherwise). The endpoint enforces a short
     per-IP rate limit; callers must cache."""
@@ -344,7 +347,12 @@ def throttle_fetch(cfg: Config) -> None:
     stamp_set(marker, time.time())
 
 
-def probe(account: Account, cfg: Config, now: float, fetcher=None):
+def probe(
+    account: Account,
+    cfg: Config,
+    now: float,
+    fetcher: Callable[[str], ProbeResult] | None = None,
+) -> ProbeResult:
     """Usage for one account, or a status word: nologin | expired |
     limited | error. Cache-first; staggered real fetches; on a
     rate-limited endpoint, falls back to the last known numbers (asof
@@ -357,7 +365,7 @@ def probe(account: Account, cfg: Config, now: float, fetcher=None):
     if prev is not None and now - prev.asof < USAGE_TTL:
         return prev  # still inside the probe TTL — a fresh-enough hit
 
-    def stale_or(word: str):
+    def stale_or(word: Literal["nologin", "expired", "limited", "error"]):
         if prev is not None and now - prev.asof <= STALE_MAX:
             return prev
         return word
@@ -382,7 +390,9 @@ def probe(account: Account, cfg: Config, now: float, fetcher=None):
     return stale_or(result)
 
 
-def offline_view(account: Account, cfg: Config, now: float):
+def offline_view(
+    account: Account, cfg: Config, now: float
+) -> Usage | Literal["nologin", "expired", "no data yet"]:
     """Cache-only view for displays (the tray): Usage — possibly stale,
     asof says how stale — or a status word. Never touches the network;
     the balancer tick is the only steady fetcher on the machine."""
@@ -419,7 +429,12 @@ def burn_rate(cfg: Config, name: str, now: float, window: int = 900) -> float:
     return max((f1 - f0) / (e1 - e0), 0.0)
 
 
-def probe_fleet(accounts: list[Account], cfg: Config, now: float, fetcher=None) -> dict:
+def probe_fleet(
+    accounts: list[Account],
+    cfg: Config,
+    now: float,
+    fetcher: Callable[[str], ProbeResult] | None = None,
+) -> dict[str, ProbeResult]:
     """Probe every account once, keyed by name (values are Usage or a status
     word). Cache-first, so real fetches stay staggered by throttle_fetch —
     the whole-fleet sweep the rebalance pull and any swap both need."""
@@ -469,15 +484,20 @@ class Candidate(NamedTuple):
 
 
 def candidates(
-    accounts: list[Account], stats: dict, exclude: str | None, now: float, cfg: Config
+    accounts: list[Account],
+    stats: dict[str, ProbeResult],
+    exclude: str | None,
+    now: float,
+    cfg: Config,
 ) -> list[Candidate]:
     """One policy row per account with known usage. Consumes the
     precomputed stats dict — never probes."""
     rows = []
     for a in accounts:
-        if a.name == exclude or not isinstance(stats.get(a.name), Usage):
+        stat = stats.get(a.name)
+        if a.name == exclude or not isinstance(stat, Usage):
             continue
-        u = normalized(stats[a.name], now)
+        u = normalized(stat, now)
         rows.append(
             Candidate(a, u, feasible_now(u, cfg, now), urgency(u, a.capacity, now))
         )
@@ -492,7 +512,11 @@ def rank(c: Candidate, now: float):
 
 
 def pick_target(
-    accounts: list[Account], stats: dict, exclude: str | None, now: float, cfg: Config
+    accounts: list[Account],
+    stats: dict[str, ProbeResult],
+    exclude: str | None,
+    now: float,
+    cfg: Config,
 ) -> Account | None:
     """The highest-urgency feasible account (5h room for a typical
     session, weekly not spent) — the one whose remaining week needs the
@@ -503,7 +527,7 @@ def pick_target(
 
 def pick_pull_target(
     accounts: list[Account],
-    stats: dict,
+    stats: dict[str, ProbeResult],
     installed: Account,
     inst_usage: Usage,
     cfg: Config,
@@ -591,7 +615,19 @@ def append_capped(path: Path, line: str, cap: int, keep: int) -> None:
         pass
 
 
-def read_state(cfg: Config, now: float) -> dict:
+class PendingSwap(TypedDict):
+    target: str
+    src_sha: str
+
+
+class State(TypedDict):
+    installed: str
+    blob_sha256: str
+    last_swap_epoch: int
+    pending: NotRequired[PendingSwap]
+
+
+def read_state(cfg: Config, now: float) -> State:
     state = read_json(cfg.state_file)
     installed = state.get("installed")
     sha = state.get("blob_sha256")
@@ -602,7 +638,7 @@ def read_state(cfg: Config, now: float) -> dict:
         sha = ""
     if not isinstance(epoch, (int, float)) or epoch < 0:
         epoch = 0
-    result: dict = {
+    result: State = {
         "installed": installed,
         "blob_sha256": sha,
         "last_swap_epoch": min(int(epoch), int(now)),
@@ -620,7 +656,11 @@ def read_state(cfg: Config, now: float) -> dict:
     return result
 
 
-def write_state(cfg: Config, state: dict) -> None:
+def write_state(cfg: Config, state: Mapping[str, object]) -> None:
+    # Serializer only — accepts a State (production callers build one) or any
+    # state-shaped mapping (test fixtures). The State shape is enforced at the
+    # construction sites (read_state/tick/harvest/commit_swap), not here, so a
+    # Mapping param keeps tests/ type-checked without an exclude.
     cfg.root.mkdir(parents=True, exist_ok=True)
     atomic_write(cfg.state_file, json.dumps(state, indent=2).encode(), mode=0o644)
 
@@ -629,13 +669,15 @@ def log_swap(cfg: Config, now: float, line: str) -> None:
     append_capped(cfg.cache / "swaps", f"{int(now)} {line}", 2000, 1000)
 
 
-def commit_swap(state: dict, installed: str, blob_sha: str, now: float) -> None:
+def commit_swap(state: State, installed: str, blob_sha: str, now: float) -> None:
     """Record a completed swap into state, in place: clear any pending
     journal, name the new installed account, stamp its blob and epoch. The
     one shape both tick's happy path and harvest's crash-recovery write, so
     the two can't drift. (Does not persist — the caller write_states.)"""
     state.pop("pending", None)
-    state.update(installed=installed, blob_sha256=blob_sha, last_swap_epoch=int(now))
+    state["installed"] = installed
+    state["blob_sha256"] = blob_sha
+    state["last_swap_epoch"] = int(now)
 
 
 # ------------------------------------------------- pool install / harvest ---
@@ -683,8 +725,8 @@ def bootstrap_pool(cfg: Config, source: Account, out=print) -> None:
 
 
 def harvest(
-    cfg: Config, accounts: list[Account], state: dict, now: float, out=print
-) -> dict:
+    cfg: Config, accounts: list[Account], state: State, now: float, out=print
+) -> State:
     """Reconcile the pool with the canonical account dirs before deciding
     anything. A pending-swap journal entry (a tick died mid-swap) is
     settled first and ends the pass — the email heuristic and the
@@ -717,7 +759,8 @@ def harvest(
             # Neither the old blob nor the journaled one — someone else
             # wrote the pool during the crash window. Identity is
             # ambiguous; never copy anything home from here.
-            state.update(installed="unknown", blob_sha256=pool_sha)
+            state["installed"] = "unknown"
+            state["blob_sha256"] = pool_sha
             out(
                 "agent-balance: pool changed during an interrupted swap; "
                 "credentials will be replaced on the next swap"
@@ -818,7 +861,7 @@ def pull_due(cfg: Config, now: float) -> bool:
 def tick(
     cfg: Config,
     now: float | None = None,
-    fetcher=None,
+    fetcher: Callable[[str], ProbeResult] | None = None,
     out=print,
     lock_wait: float = 0.0,
 ) -> int:
@@ -842,10 +885,12 @@ def tick(
         state = harvest(cfg, accounts, state, now, out)
         installed = by_name(accounts, state["installed"])
 
-        need = reason = None
+        need: Literal["hard", "roll", "soft"] | None = None
+        reason: str | None = None
         five_now = 0.0
         est = ""
-        st = None  # the installed probe, or a status word; None when uninstalled
+        # the installed probe, or a status word; None when uninstalled
+        st: ProbeResult | None = None
         if installed is None:
             need, reason = "hard", "no account installed"
         else:
@@ -888,7 +933,8 @@ def tick(
         # needs a much higher burn rate to avoid expiring unused. Sessions
         # don't notice the swap. The margin is the hysteresis: after the
         # pull, no other account clears the bar against the new installed.
-        stats = pulled = None
+        stats: dict[str, ProbeResult] | None = None
+        pulled: Account | None = None
         if (
             need is None
             and installed is not None
