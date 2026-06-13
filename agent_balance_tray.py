@@ -15,14 +15,12 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -37,37 +35,36 @@ from gi.repository import GLib, Gtk
 GREEN, YELLOW, RED, DIM = "#73d216", "#edd400", "#ef2929", "#888888"
 BAR_ON, BAR_OFF = "▰", "▱"
 
-
-def load_agent_balance():
-    """Import the agent_balance module — from the same directory when run
-    out of the repo, else from the installed `agent-balance` script."""
-    try:
-        import agent_balance
-
-        return agent_balance
-    except ImportError:
-        pass
-    candidates = [Path(__file__).resolve().with_name("agent_balance.py")]
-    installed = shutil.which("agent-balance")
-    if installed:
-        candidates.append(Path(installed))
-    for cand in candidates:
-        if cand.is_file():
-            loader = importlib.machinery.SourceFileLoader("agent_balance", str(cand))
-            spec = importlib.util.spec_from_loader("agent_balance", loader)
-            mod = importlib.util.module_from_spec(spec)
-            # Register BEFORE exec: dataclass creation resolves the module
-            # through sys.modules when annotations are strings.
-            sys.modules["agent_balance"] = mod
-            loader.exec_module(mod)
-            return mod
-    sys.exit(
-        "agent-balance-tray: agent_balance.py not found "
-        "(install agent-balance or run from the repo)"
-    )
+# The tray owns its presentation: the `status --json` contract ships RAW
+# numbers plus a single `now`, so countdown/staleness are recomputed here at
+# GTK draw time (the JSON may be seconds old). These are verbatim copies of
+# agent_balance's reset_in and stale_age_min — trivial, branch-free, and the
+# ab-side logic stays covered by test_format.py. Keeping them local is what
+# lets the tray drop its import of agent_balance entirely.
+USAGE_STALE_AFTER = 90  # = 2 * agent-balance USAGE_TTL; the tray's own copy
 
 
-ab = load_agent_balance()
+def reset_in(epoch: int, now: float) -> str:
+    """Compact reset countdown — verbatim copy of agent_balance.reset_in."""
+    if epoch == 0:
+        return "-"
+    s = epoch - now
+    if s <= 0:
+        return "now"
+    if s < 3600:
+        return f"{int(s // 60) + 1}m"
+    if s < 86400:
+        return f"{round(s / 3600)}h"
+    return f"{round(s / 86400)}d"
+
+
+def stale_age_min(asof: float, now: float) -> float | None:
+    """Age in minutes once it crosses the staleness threshold; None when
+    fresh (or asof unknown) — the tray's copy of agent_balance.stale_age_min,
+    reading the raw asof epoch out of the JSON usage block."""
+    if asof and now - asof > USAGE_STALE_AFTER:
+        return (now - asof) / 60
+    return None
 
 
 def esc(text: str) -> str:
@@ -90,7 +87,8 @@ def bar_markup(pct: float) -> str:
 class Row(NamedTuple):
     name: str
     email: str
-    view: object  # ab.Usage | status word
+    usage: dict | None  # {"five","seven","r5","r7","asof"} or None (word row)
+    status: str | None  # status word, or None when usage is present
     installed: bool
 
 
@@ -104,18 +102,44 @@ class Snapshot:
     error: str | None = None  # collection blew up; rows are empty
 
 
-def collect() -> Snapshot:
-    """Worker-thread data gathering. Cache-only (offline_view): the tray
-    never fetches — the balancer tick is the machine's only steady poller,
-    so the tray adds zero load to the rate-limited usage endpoint."""
-    cfg = ab.make_config()
-    now = time.time()
-    state = ab.read_state(cfg, now)
+def cli() -> str | None:
+    return shutil.which("agent-balance")
+
+
+def collect(refresh: bool = False) -> Snapshot:
+    """Worker-thread data gathering: shell out to `agent-balance status
+    --json` and parse the DATA contract. Default is cache-only (the balancer
+    tick is the machine's only steady poller, so passive redraws add zero
+    load); refresh=True runs `--refresh`, which makes the CLI do a staggered,
+    cooldown-aware fleet sweep server-side. Any failure becomes a Snapshot
+    with .error set so the tray shows an error row instead of crashing."""
+    exe = cli()
+    if not exe:
+        return Snapshot(error="agent-balance not found on PATH")
+    cmd = [exe, "status", "--json"] + (["--refresh"] if refresh else [])
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=(30 if refresh else 10)
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return Snapshot(error=f"agent-balance failed: {e}")
+    if r.returncode != 0:
+        return Snapshot(
+            error=(r.stderr.strip() or f"agent-balance exited {r.returncode}")
+        )
+    try:
+        doc = json.loads(r.stdout)
+    except ValueError as e:
+        return Snapshot(error=f"bad status JSON: {e}")
     rows = [
-        Row(a.name, a.email, ab.offline_view(a, cfg, now), a.name == state["installed"])
-        for a in ab.discover_accounts(cfg)
+        Row(a["name"], a["email"], a.get("usage"), a.get("status"), a["installed"])
+        for a in doc.get("accounts", [])
     ]
-    return Snapshot(now, state["installed"], rows)
+    return Snapshot(
+        now=doc["now"],
+        installed_name=(doc.get("installed") or {}).get("name", ""),
+        rows=rows,
+    )
 
 
 class Tray:
@@ -128,16 +152,21 @@ class Tray:
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_menu(self.build_menu(Snapshot()))
         self.refresh()
-        interval = max(int(ab.make_config().interval), 30)
+        # Honor a tuned cadence without importing agent_balance: read the same
+        # env knob the CLI's make_config reads, default 60, floor 30.
+        try:
+            interval = max(int(os.environ.get("AGENT_BALANCE_INTERVAL") or 60), 30)
+        except ValueError:
+            interval = 60
         GLib.timeout_add_seconds(interval, self.refresh)
 
-    def refresh(self):
-        threading.Thread(target=self._work, daemon=True).start()
+    def refresh(self, force: bool = False):
+        threading.Thread(target=self._work, args=(force,), daemon=True).start()
         return True  # keep the GLib timer alive
 
-    def _work(self):
+    def _work(self, force: bool):
         try:
-            snap = collect()
+            snap = collect(force)
         except Exception as e:  # never let a probe hiccup kill the tray
             snap = Snapshot(error=str(e))
         GLib.idle_add(self._update, snap)
@@ -145,11 +174,11 @@ class Tray:
     def _update(self, snap: Snapshot):
         if snap.error is None:  # on a hiccup, keep the last good label
             installed = next((r for r in snap.rows if r.installed), None)
-            if installed and isinstance(installed.view, ab.Usage):
+            if installed and installed.usage is not None:
                 # Identity is the email, not the directory name; the local
                 # part keeps the label short.
                 who = (installed.email or installed.name).split("@")[0]
-                self.indicator.set_label(f" {who} {installed.view.five:.0f}%", "")
+                self.indicator.set_label(f" {who} {installed.usage['five']:.0f}%", "")
             else:
                 self.indicator.set_label(f" {snap.installed_name}", "")
         self.indicator.set_menu(self.build_menu(snap))
@@ -167,26 +196,29 @@ class Tray:
         menu.append(self.row_item("<b>CLAUDE</b>"))
         for row in snap.rows:
             who = row.email or row.name  # emails are identity; dirs are plumbing
-            st = row.view
-            if isinstance(st, ab.Usage):
-                stale = ab.stale_age_min(st, snap.now)
+            if row.usage is not None:
+                u = row.usage
+                stale = stale_age_min(u["asof"], snap.now)
                 age = (
                     f"<span foreground='{DIM}'> · {stale:.0f}m old</span>"
                     if stale is not None
                     else ""
                 )
-                r5 = ab.reset_in(st.r5, snap.now)
-                r7 = ab.reset_in(st.r7, snap.now)
+                r5 = reset_in(u["r5"], snap.now)
+                r7 = reset_in(u["r7"], snap.now)
                 cells = (
                     f"{esc(who):<32} "
-                    f"{bar_markup(st.five)}"
+                    f"{bar_markup(u['five'])}"
                     f"<span foreground='{DIM}'> {r5:<4}</span>"
-                    f"{bar_markup(st.seven)}"
+                    f"{bar_markup(u['seven'])}"
                     f"<span foreground='{DIM}'> {r7:<3}</span>"
                     f"{age}"
                 )
             else:
-                cells = f"{esc(who):<32} <span foreground='{DIM}'>{esc(str(st))}</span>"
+                cells = (
+                    f"{esc(who):<32} "
+                    f"<span foreground='{DIM}'>{esc(str(row.status))}</span>"
+                )
             if row.installed:
                 cells += f" <span foreground='{GREEN}'>◀ installed</span>"
             menu.append(self.row_item(cells))
@@ -212,27 +244,23 @@ class Tray:
 
     def on_tick(self, *_):
         def run():
-            exe = shutil.which("agent-balance")
+            exe = cli()
             if exe:
                 subprocess.run([exe, "tick"], capture_output=True)
+                self.refresh()
             else:
-                ab.tick(ab.make_config(), out=lambda *_: None)
-            self.refresh()
+                # No import fallback by design (Issue 1's no-import rule): off
+                # PATH the tray can't tick — just redraw to surface the error row.
+                self.refresh()
 
         threading.Thread(target=run, daemon=True).start()
 
     def on_refresh(self, *_):
-        """Force a real fleet probe (staggered, cooldown-aware), then
-        redraw — unlike the passive 60s redraws, which are cache-only."""
-
-        def run():
-            cfg = ab.make_config()
-            now = time.time()
-            for a in ab.discover_accounts(cfg):
-                ab.probe(a, cfg, now)
-            self.refresh()
-
-        threading.Thread(target=run, daemon=True).start()
+        """Force a real fleet probe (staggered, cooldown-aware), then redraw —
+        unlike the passive redraws, which are cache-only. collect(refresh=True)
+        runs `status --json --refresh`, so probe_fleet's PROBE_SPACING /
+        LIMITED_COOLDOWN / STALE_MAX invariants stay enforced server-side."""
+        self.refresh(force=True)
 
 
 def install_autostart() -> int:
