@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    name: py${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Provide Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+      - name: Sync on ${{ matrix.python }}
+        run: uv sync --python ${{ matrix.python }}
+      - name: pytest
+        run: uv run --python ${{ matrix.python }} pytest -q
+      - name: ruff
+        run: uv run --python ${{ matrix.python }} ruff check .
+      - name: ty (project)
+        run: uv run --python ${{ matrix.python }} ty check
+      - name: ty (shipped artifact)
+        run: uv run --python ${{ matrix.python }} ty check agent_balance.py
