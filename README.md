@@ -31,7 +31,7 @@ agent-balance: swapped alt1 -> alt2 (you+2@example.com) — 5h 0%, 7d 18% [5h at
 ```
 
 Linux only (macOS keeps Claude credentials in the Keychain; hot-swapping
-there is unimplemented). Python 3.10+, stdlib only.
+there is unimplemented). Python 3.11+, stdlib only.
 
 ## How it works
 
@@ -138,6 +138,43 @@ Tuning (env vars, also honored by the systemd unit if set at install time):
 | `AGENT_BALANCE_PULL_MARGIN` | `10` | rebalance pull: proactively swap when another account's urgency (required %/day) beats the installed one's by this margin (`0` disables) |
 | `AGENT_PICK_ROOT` | `~/.claude-accounts` | accounts root, shared with agent-pick |
 
+### Tuning the knobs
+
+The table is the reference; this is how to think about changing the four
+behavioral knobs. They divide cleanly: **threshold** and **draw** govern when
+a *single* account is too full to ride or to move onto, **pull_margin** and
+**min_gap** govern the *proactive* rebalance between accounts.
+
+- **`AGENT_BALANCE_THRESHOLD`** (default `99`) — how high to ride the 5h
+  window before a forced roll. It's safe at 99 because the burn-rate
+  projection swaps early whenever the recent slope would cross 100% within
+  two ticks, so a slow burn rides the window to the wall while a fast,
+  parallel burst rotates with exactly the margin it needs. Raise toward 100
+  to squeeze every last point out of each account; lower it (e.g. `85`) for a
+  wider safety margin on bursty multi-agent workflows, where the 2-tick
+  lookahead can under-cover a burst that starts from a cold probe history.
+- **`AGENT_BALANCE_DRAW`** (default `10`) — the 5h points a typical session is
+  assumed to consume. It feeds two gates: feasibility (`5h% + draw < 100`, so
+  the balancer won't install an account a single session would immediately
+  wall) and the rebalance pull's headroom check (`5h% + draw < threshold`, so
+  a proactive swap never lands on an almost-full account). Raise it for heavy
+  sessions; lower it toward 0 for light ones, which keeps more accounts
+  feasible.
+- **`AGENT_BALANCE_PULL_MARGIN`** (default `10`, %/day) — the rebalance pull's
+  trigger and its hysteresis in one number. Setting it to `0` disables
+  proactive rebalancing entirely (and with it the ~5-minute whole-fleet
+  probe, so the balancer sends no extra API traffic). The effective margin is
+  `max(pull_margin, 0.15 × installed urgency)`, so it auto-scales up near a
+  reset deadline; raise it for fewer, calmer rotations.
+- **`AGENT_BALANCE_MIN_GAP`** (default `300`s) — minimum seconds between
+  *soft* (rebalance) swaps; pure flap damping. Hard rolls (a 5h wall) and
+  expired-token swaps bypass it, so safety actions never wait out a gap. Raise
+  it if proactive rotations feel chatty.
+
+Note the coupling: **threshold and draw together set the pull's headroom bar**
+(`5h% + draw < threshold`), so raising `threshold` without also raising `draw`
+lets the pull move onto fuller accounts.
+
 ## Tray indicator (GNOME)
 
 `agent-balance-tray` puts the account table in your system tray: the icon
@@ -181,8 +218,12 @@ gir1.2-ayatanaappindicator3-0.1` if missing.
 The design rests on behavior verified against Claude Code v2.1.175 (Linux)
 with controlled two-turn sessions — swapping the credentials file between
 turns for garbage (next turn fails `401`) and for a second valid account
-(next turn succeeds on the other account). Details, the tick algorithm, and
-troubleshooting live in [docs/balancing.md](docs/balancing.md).
+(next turn succeeds on the other account). That verified version is encoded as
+the `VERIFIED_CLAUDE_VERSION` constant in `agent_balance.py` (the single
+machine-checked source of truth); `status` and `install` run a soft, non-fatal
+`claude --version` check and warn when the installed major.minor differs.
+Details, the tick algorithm, and troubleshooting live in
+[docs/balancing.md](docs/balancing.md).
 
 ## Development
 
