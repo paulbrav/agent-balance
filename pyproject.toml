@@ -5,9 +5,12 @@ description = "Swap Claude accounts beneath running sessions before the 5-hour l
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Paul Braverman" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 # Runtime is stdlib-only on purpose: install.sh can drop the scripts onto
-# any box with a system python, no venv needed. Keep it that way.
+# any box with a system python (>=3.11), no venv needed. Keep it that way.
+# Dev/CI runs on a newer Python (uv pins it via .python-version); the floor
+# above is what the shipped script must stay compatible with — ruff and ty
+# below target that floor, not the dev interpreter.
 dependencies = []
 
 [project.urls]
@@ -34,7 +37,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
@@ -47,7 +50,7 @@ known-first-party = ["agent_balance"]
 "agent_balance_tray.py" = ["E402"]
 
 [tool.ty.environment]
-python-version = "3.10"
+python-version = "3.11"
 
 [tool.ty.src]
 # The tray imports gi (no type stubs, system-python only).
