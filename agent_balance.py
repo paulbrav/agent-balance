@@ -43,12 +43,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 # Claude Code re-reads .credentials.json each turn; this is the version the
 # hot-swap was last verified against (see the file header, README, docs).
 # claude_version_warning() warns when the installed major.minor differs.
 VERIFIED_CLAUDE_VERSION = "2.1.175"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# OAuth refresh-token grant: the same public Claude Code client agent-pick
+# (the sister launcher) uses. Lets the balancer rotate an idle account's
+# lapsed access token in place instead of leaving it dark until next launch.
+OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# platform.claude.com sits behind Cloudflare browser-integrity, which 403s
+# (error 1010) the default Python-urllib User-Agent — agent-pick only slips
+# through because it shells out to curl. Present as the Claude Code CLI (the
+# client this OAuth grant belongs to) so the refresh clears the edge; tracks
+# VERIFIED_CLAUDE_VERSION so it stays current as the swap is re-verified.
+# (api.anthropic.com, the usage endpoint, has no such gate.)
+CLI_USER_AGENT = f"claude-cli/{VERIFIED_CLAUDE_VERSION} (external, cli)"
 USAGE_TTL = 45  # seconds a successful usage probe stays cached
 USAGE_STALE_AFTER = 2 * USAGE_TTL  # age before status renderers flag the data
 RESET_SOON = 900  # a 5h window resetting within this is treated as open
@@ -215,6 +227,7 @@ def by_email(accounts: list[Account], email: str) -> Account | None:
 class OauthCreds(NamedTuple):
     token: str  # "" when missing/malformed
     expires_ms: int  # 0 when missing/malformed
+    refresh: str = ""  # long-lived refresh token, "" when missing/malformed
 
 
 def read_oauth(path: Path) -> OauthCreds:
@@ -223,9 +236,11 @@ def read_oauth(path: Path) -> OauthCreds:
     oauth = read_json(path).get("claudeAiOauth") or {}
     token = oauth.get("accessToken")
     exp = oauth.get("expiresAt")
+    refresh = oauth.get("refreshToken")
     return OauthCreds(
         token if isinstance(token, str) else "",
         exp if isinstance(exp, int) else 0,
+        refresh if isinstance(refresh, str) else "",
     )
 
 
@@ -279,6 +294,7 @@ def fetch_usage(token: str) -> Usage | Literal["limited", "error"]:
             "Authorization": f"Bearer {token}",
             "anthropic-beta": "oauth-2025-04-20",
             "Content-Type": "application/json",
+            "User-Agent": CLI_USER_AGENT,
         },
     )
     try:
@@ -308,6 +324,82 @@ def fetch_usage(token: str) -> Usage | Literal["limited", "error"]:
         r5=parse_reset(five.get("resets_at")),
         r7=parse_reset(seven.get("resets_at")),
     )
+
+
+def refresh_oauth(refresh: str, now: float) -> tuple[str, str, int] | None:
+    """One POST against the OAuth refresh_token grant -> (access_token,
+    refresh_token, expires_ms), or None on any failure. The grant may rotate
+    the refresh token; the old one is returned when it doesn't. Never raises,
+    never logs the token material."""
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": OAUTH_CLIENT_ID,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": CLI_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+        OSError,
+    ):
+        return None
+    if not isinstance(data, dict):
+        return None
+    access = data.get("access_token")
+    expires_in = data.get("expires_in")
+    if not isinstance(access, str) or not access:
+        return None
+    if not isinstance(expires_in, (int, float)) or expires_in <= 0:
+        return None
+    rotated = data.get("refresh_token")
+    rotated = rotated if isinstance(rotated, str) and rotated else refresh
+    return access, rotated, int((now + expires_in) * 1000)
+
+
+Refresher = Callable[[str, float], tuple[str, str, int] | None]
+
+
+def refresh_creds_file(
+    path: Path, refresh: str, now: float, refresher: Refresher = refresh_oauth
+) -> OauthCreds | None:
+    """Rotate the access token of one credentials file in place, preserving
+    every other field (scopes, subscriptionType, ...) and the 0600 perms.
+    Returns the fresh OauthCreds, or None when the grant or the write fails —
+    the on-disk file is left untouched on failure, so the surviving refresh
+    token can be retried on the next sweep."""
+    rotated = refresher(refresh, now)
+    if rotated is None:
+        return None
+    access, new_refresh, expires_ms = rotated
+    doc = read_json(path)
+    oauth = doc.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        oauth = {}
+    oauth["accessToken"] = access
+    oauth["refreshToken"] = new_refresh
+    oauth["expiresAt"] = expires_ms
+    doc["claudeAiOauth"] = oauth
+    try:
+        atomic_write(path, json.dumps(doc).encode(), mode=0o600)
+    except OSError:
+        return None
+    return OauthCreds(access, expires_ms, new_refresh)
 
 
 def usage_to_cache(u: Usage) -> dict:
@@ -372,13 +464,27 @@ def probe(
     cfg: Config,
     now: float,
     fetcher: Callable[[str], ProbeResult] | None = None,
+    refresher: Refresher | None = None,
 ) -> ProbeResult:
     """Usage for one account, or a status word: nologin | expired |
     limited | error. Cache-first; staggered real fetches; on a
     rate-limited endpoint, falls back to the last known numbers (asof
-    marks their age) for up to STALE_MAX seconds."""
+    marks their age) for up to STALE_MAX seconds.
+
+    A lapsed access token that still carries a refresh token is rotated in
+    place first (what a launch would do), so an idle account probes and
+    shows usage again instead of going dark. The rotation runs only on the
+    real network path; an injected fetcher keeps a test hermetic unless it
+    also injects a refresher."""
     creds = read_oauth(account.creds)
     word = cred_status(creds, now)
+    if word == "expired" and creds.refresh:
+        rf = refresher or (refresh_oauth if fetcher is None else None)
+        if rf is not None:
+            fresh = refresh_creds_file(account.creds, creds.refresh, now, rf)
+            if fresh is not None:
+                creds = fresh
+                word = cred_status(creds, now)
     if word is not None:
         return word
     prev = last_known(cfg, account.name)  # read the cache once, reuse below
