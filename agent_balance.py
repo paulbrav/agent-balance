@@ -33,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -43,6 +44,10 @@ from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict
 
 VERSION = "0.3.0"
+# Claude Code re-reads .credentials.json each turn; this is the version the
+# hot-swap was last verified against (see the file header, README, docs).
+# claude_version_warning() warns when the installed major.minor differs.
+VERIFIED_CLAUDE_VERSION = "2.1.175"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_TTL = 45  # seconds a successful usage probe stays cached
 USAGE_STALE_AFTER = 2 * USAGE_TTL  # age before status renderers flag the data
@@ -248,6 +253,9 @@ class Usage:
 
 
 ProbeResult = Usage | Literal["nologin", "expired", "limited", "error"]
+# What status rows can hold: probe()'s ProbeResult plus offline_view's extra
+# "no data yet" word (the JSON-default path renders cache-only views).
+StatusView = Usage | Literal["nologin", "expired", "limited", "error", "no data yet"]
 
 
 def parse_reset(value) -> int:
@@ -280,8 +288,20 @@ def fetch_usage(token: str) -> Usage | Literal["limited", "error"]:
         return "limited" if e.code == 429 else "error"
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return "error"
+    # Loud guard against silent endpoint schema drift: a real response always
+    # carries at least one window (present-but-zero still ships the block).
+    # Both absent => keys renamed/removed => 'error' rather than mis-reading a
+    # fresh account at 0% and never swapping.
+    if not isinstance(data, dict) or (
+        "five_hour" not in data and "seven_day" not in data
+    ):
+        return "error"
     five = data.get("five_hour") or {}
     seven = data.get("seven_day") or {}
+    if not isinstance(five, dict):
+        five = {}
+    if not isinstance(seven, dict):
+        seven = {}
     return Usage(
         five=float(five.get("utilization") or 0),
         seven=float(seven.get("utilization") or 0),
@@ -564,10 +584,25 @@ def sha256_file(path: Path) -> str:
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    tmp.write_bytes(data)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    """Write atomically. The temp is created 0600 by mkstemp, so a
+    credentials blob is never momentarily world/group-readable at umask
+    perms before the chmod; mode then sets the final bits (creds 0600,
+    cache/state/meta 0644)."""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def copy_creds(src: Path, dst: Path) -> str:
@@ -1030,15 +1065,138 @@ def stale_age_min(u: Usage, now: float) -> float | None:
     return None
 
 
-def cmd_status(cfg: Config) -> int:
+# ----------------------------------------------- Claude Code version check ---
+
+
+class ClaudeVersion(NamedTuple):
+    verified: str
+    installed: str | None  # None when claude not on PATH / unparseable
+    mismatch: bool
+
+
+def _major_minor(version: str) -> tuple[int, int] | None:
+    token = version.strip().split()[0] if version.strip() else ""
+    parts = token.split(".")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def check_claude_version(timeout: float = 5) -> ClaudeVersion:
+    """Run `claude --version` (short timeout, non-fatal). Returns a
+    ClaudeVersion; installed=None and mismatch=False on any failure (not on
+    PATH, timeout, non-zero, unparseable). Never raises."""
+    installed_str: str | None = None
+    try:
+        r = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=timeout
+        )
+        if r.returncode == 0:
+            installed_str = r.stdout.strip().split()[0] if r.stdout.strip() else None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    inst = _major_minor(installed_str or "")
+    ver = _major_minor(VERIFIED_CLAUDE_VERSION)
+    mismatch = inst is not None and ver is not None and inst != ver
+    return ClaudeVersion(VERIFIED_CLAUDE_VERSION, installed_str, mismatch)
+
+
+def claude_version_warning_from(cv: ClaudeVersion) -> str | None:
+    """Format the soft mismatch warning from an already-gathered
+    ClaudeVersion (no subprocess); None when there is nothing to warn about."""
+    if not cv.mismatch:
+        return None
+    return (
+        f"agent-balance: Claude Code {cv.installed} differs from the verified "
+        f"{cv.verified}; the hot-swap relies on Claude re-reading "
+        ".credentials.json each turn — verify swaps still take effect."
+    )
+
+
+def claude_version_warning(timeout: float = 5) -> str | None:
+    """Thin string wrapper over check_claude_version for the install path."""
+    return claude_version_warning_from(check_claude_version(timeout))
+
+
+# ----------------------------------------------------- status: gather/render ---
+
+
+def query_timer() -> str:
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", "agent-balance.timer"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return r.stdout.strip() or "inactive"
+    except (OSError, subprocess.TimeoutExpired):
+        return "no systemd"
+
+
+def read_swap_tail(cfg: Config) -> list[str]:
+    swaps = cfg.cache / "swaps"
+    if swaps.is_file():
+        return swaps.read_text().splitlines()[-5:]
+    return []
+
+
+class StatusAccount(NamedTuple):
+    name: str
+    email: str
+    installed: bool
+    view: StatusView
+
+
+@dataclass(frozen=True)
+class StatusSnapshot:
+    now: float
+    root: Path
+    accounts: list[StatusAccount]
+    pool: Path
+    pool_exists: bool
+    installed: str
+    last_swap_epoch: int
+    timer: str
+    recent_swaps: list[str]
+    claude_version: ClaudeVersion
+
+
+def gather_status(cfg: Config, *, network: bool) -> StatusSnapshot:
     now = time.time()
     accounts = discover_accounts(cfg)
     state = read_state(cfg, now)
+    if network:
+        probe_fleet(accounts, cfg, now)  # --refresh: staggered real sweep, warms cache
 
-    print(f"accounts ({cfg.root}):")
-    for a in accounts:
-        st = probe(a, cfg, now)
-        mark = " <- installed" if a.name == state["installed"] else ""
+    def view(a: Account) -> StatusView:
+        return probe(a, cfg, now) if network else offline_view(a, cfg, now)
+
+    rows = [
+        StatusAccount(a.name, a.email, a.name == state["installed"], view(a))
+        for a in accounts
+    ]
+    return StatusSnapshot(
+        now=now,
+        root=cfg.root,
+        accounts=rows,
+        pool=cfg.pool,
+        pool_exists=cfg.pool.is_dir(),
+        installed=state["installed"],
+        last_swap_epoch=state["last_swap_epoch"],
+        timer=query_timer(),
+        recent_swaps=read_swap_tail(cfg),
+        claude_version=check_claude_version(),
+    )
+
+
+def render_status_text(snap: StatusSnapshot) -> None:
+    now = snap.now
+    print(f"accounts ({snap.root}):")
+    for a in snap.accounts:
+        st = a.view
+        mark = " <- installed" if a.installed else ""
         if isinstance(st, Usage):
             stale = stale_age_min(st, now)
             age = f" [{stale:.0f}m old]" if stale is not None else ""
@@ -1049,40 +1207,97 @@ def cmd_status(cfg: Config) -> int:
             )
         else:
             print(f"  {a.name:<12} {a.email:<32} {st}{mark}")
-    if not accounts:
+    if not snap.accounts:
         print("  (none logged in)")
 
     print(
-        f"\npool: {cfg.pool} "
-        f"({'exists' if cfg.pool.is_dir() else 'not bootstrapped yet'})"
+        f"\npool: {snap.pool} "
+        f"({'exists' if snap.pool_exists else 'not bootstrapped yet'})"
     )
-    print(f"installed: {state['installed']}", end="")
-    if state["last_swap_epoch"]:
-        mins = int((now - state["last_swap_epoch"]) / 60)
+    print(f"installed: {snap.installed}", end="")
+    if snap.last_swap_epoch:
+        mins = int((now - snap.last_swap_epoch) / 60)
         print(f" (last swap {mins}m ago)")
     else:
         print()
 
-    timer = "no systemd"
-    try:
-        r = subprocess.run(
-            ["systemctl", "--user", "is-active", "agent-balance.timer"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        timer = r.stdout.strip() or "inactive"
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    print(f"timer: {timer}")
+    print(f"timer: {snap.timer}")
 
-    swaps = cfg.cache / "swaps"
-    if swaps.is_file():
-        tail = swaps.read_text().splitlines()[-5:]
-        if tail:
-            print("recent swaps:")
-            for line in tail:
-                print(f"  {line}")
+    if snap.recent_swaps:
+        print("recent swaps:")
+        for line in snap.recent_swaps:
+            print(f"  {line}")
+
+    # Appended LAST so a match/claude-absent run leaves the byte stream above
+    # untouched; only a real major.minor mismatch prints this extra line.
+    warning = claude_version_warning_from(snap.claude_version)
+    if warning:
+        print(warning)
+
+
+def snapshot_to_json(snap: StatusSnapshot) -> dict:
+    """The sole author of the `status --json` document shape (mirrors
+    usage_to_cache's single-source pattern). Numbers stay raw so the contract
+    survives CLI text changes; consumers recompute countdowns from `now`."""
+
+    def acct(a: StatusAccount) -> dict:
+        if isinstance(a.view, Usage):
+            u = a.view
+            return {
+                "name": a.name,
+                "email": a.email,
+                "installed": a.installed,
+                "usage": {
+                    "five": u.five,
+                    "seven": u.seven,
+                    "r5": u.r5,
+                    "r7": u.r7,
+                    "asof": u.asof,
+                },
+                "status": None,
+            }
+        return {
+            "name": a.name,
+            "email": a.email,
+            "installed": a.installed,
+            "usage": None,
+            "status": str(a.view),
+        }
+
+    cv = snap.claude_version
+    return {
+        "version": VERSION,
+        "now": snap.now,
+        "root": str(snap.root),
+        "accounts": [acct(a) for a in snap.accounts],
+        "pool": {"path": str(snap.pool), "exists": snap.pool_exists},
+        "installed": {
+            "name": snap.installed,
+            "last_swap_epoch": snap.last_swap_epoch,
+        },
+        "timer": snap.timer,
+        "recent_swaps": snap.recent_swaps,
+        "claude_version": {
+            "verified": cv.verified,
+            "installed": cv.installed,
+            "mismatch": cv.mismatch,
+        },
+    }
+
+
+def render_status_json(snap: StatusSnapshot) -> None:
+    print(json.dumps(snapshot_to_json(snap), indent=2))
+
+
+def cmd_status(cfg: Config, *, as_json: bool = False, refresh: bool = False) -> int:
+    # CLI text path uses probe (network=True) == today's behavior, byte-for-byte.
+    # JSON default uses offline_view (cache-only) to preserve the tray's zero
+    # passive load; JSON --refresh runs a staggered fleet sweep first.
+    snap = gather_status(cfg, network=(not as_json) or refresh)
+    if as_json:
+        render_status_json(snap)
+    else:
+        render_status_text(snap)
     return 0
 
 
@@ -1106,6 +1321,7 @@ def unit_dir() -> Path:
 def cmd_install(cfg: Config) -> int:
     exe = Path(sys.argv[0]).resolve()
     cmd = str(exe) if os.access(exe, os.X_OK) else f"{sys.executable} {exe}"
+    warning = claude_version_warning()  # one-time setup nudge; never fatal
     env_lines = "".join(
         f"Environment={key}={os.environ[key]}\n"
         for key in ENV_KEYS
@@ -1148,11 +1364,15 @@ def cmd_install(cfg: Config) -> int:
         print("Run the balancer another way:")
         print("  agent-balance watch                       # foreground loop")
         print(f"  * * * * * {cmd} tick                     # crontab line")
+        if warning:
+            print(warning)
         return 0
     print(
         f"agent-balance: timer enabled — ticking every {cfg.interval}s. Watch it with:"
     )
     print("  journalctl --user -u agent-balance -f")
+    if warning:
+        print(warning)
     return 0
 
 
@@ -1217,7 +1437,9 @@ def main(argv: list[str] | None = None) -> int:
         "--version", action="version", version=f"agent-balance {VERSION}"
     )
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("status", help="accounts, installed creds, timer health")
+    status_p = sub.add_parser("status", help="accounts, installed creds, timer health")
+    status_p.add_argument("--json", action="store_true", dest="as_json")
+    status_p.add_argument("--refresh", action="store_true")
     sub.add_parser("tick", help="one idempotent balance pass")
     sub.add_parser("watch", help="foreground tick loop")
     sub.add_parser("install", help="enable the systemd user timer")
@@ -1241,7 +1463,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if ns.command in (None, "status"):
-        return cmd_status(cfg)
+        return cmd_status(
+            cfg,
+            as_json=getattr(ns, "as_json", False),
+            refresh=getattr(ns, "refresh", False),
+        )
     if ns.command == "tick":
         return tick(cfg)
     if ns.command == "watch":

@@ -4,7 +4,11 @@
 
 Established 2026-06-12 against Claude Code v2.1.175 on Linux (plaintext
 credential backend), with controlled two-turn headless sessions
-(`--input-format stream-json`) and string analysis of the installed binary:
+(`--input-format stream-json`) and string analysis of the installed binary.
+That version lives in code as the `VERIFIED_CLAUDE_VERSION` constant — the
+single machine-checked source of truth — which a soft, non-fatal `claude
+--version` check (surfaced on `install` and in `status`) compares against the
+installed major.minor:
 
 1. **Credentials are re-read from disk on every turn.** Replacing
    `$CLAUDE_CONFIG_DIR/.credentials.json` with garbage between two turns made
@@ -99,6 +103,59 @@ State lives in `$ROOT/.balancer-state.json` (`installed`, `blob_sha256`,
 cache, because losing the installed-account mapping is the one thing that
 risks a broken refresh chain. If it's deleted or corrupted, the next harvest
 re-identifies the pool blob by email and rebuilds it.
+
+## Tuning the knobs
+
+Four environment variables shape the tick described above. Each one maps onto
+a specific part of the urgency / feasibility / projection machinery, so the
+right value depends on which part you're trying to bias.
+
+- **`AGENT_BALANCE_THRESHOLD`** (default `99`) — the roll trigger's static
+  ceiling (step 3, the **roll** class). The default is deliberately high
+  because it is never the only line of defense: the burn-rate projection rolls
+  early whenever `current% + slope × two tick intervals` crosses 100%, and
+  stale numbers are extrapolated forward by the same slope first. So a slow
+  burn legitimately rides the window to 99%, while a heavily parallel workflow
+  burning several %/minute is rolled with precisely the lead time its slope
+  implies. Raising toward 100 squeezes each account harder; lowering it (e.g.
+  `85`) buys a wider static margin for bursty workflows whose probe history is
+  too cold for the projection to have a slope yet — the one residual blind
+  spot the projection can't cover. (`AGENT_BALANCE_INTERVAL=30` attacks the
+  same blind spot from the other side, by shrinking the window itself.)
+- **`AGENT_BALANCE_DRAW`** (default `10`) — the 5h points one typical session
+  is assumed to consume. It is the slack term in two feasibility tests in the
+  **pick** step. `feasible_now` requires `5h% + draw < 100` (or an imminent
+  reset), which is what stops the balancer from installing an account a single
+  session would immediately wall. The rebalance pull additionally requires
+  `5h% + draw < threshold` of any pull target, so a proactive swap never moves
+  onto an almost-walled account. Raise `draw` for heavy sessions (more
+  conservative — fewer accounts qualify as a swap target); lower it toward 0
+  for light sessions, which keeps more accounts feasible and lets the pull use
+  fuller accounts that a typical session won't exhaust.
+- **`AGENT_BALANCE_PULL_MARGIN`** (default `10`, %/day) — the **soft**
+  rebalance pull's both trigger and hysteresis. A target must beat the
+  installed account's urgency (required %/day to clear its week) by
+  `max(pull_margin, 0.15 × installed urgency)` before the balancer rotates
+  toward it. The `0.15 × installed urgency` floor makes the effective margin
+  scale up automatically as a reset deadline nears (where urgency diverges),
+  so the pull gets *less* twitchy exactly when urgencies are large and noisy.
+  Because the same margin is the post-swap hysteresis — after a pull, no other
+  account clears the bar against the newly installed one — raising it yields
+  fewer, calmer rotations. Setting it to `0` disables the pull and the
+  ~5-minute whole-fleet probe (`PULL_CHECK`) altogether, dropping the
+  balancer's API traffic to the installed account's ~1 req/min.
+- **`AGENT_BALANCE_MIN_GAP`** (default `300`s) — the minimum seconds between
+  *soft* swaps, applied in step 3 only to the `need == "soft"` branch. It is
+  pure flap damping for the rebalance pull and nothing else: **hard** swaps
+  (no account, expired/missing token) and **roll** swaps (the 5h wall, or the
+  projection) deliberately bypass it, so a safety action can never queue behind
+  a recent optimization swap. Raise it if proactive rotations feel chatty;
+  it has no effect on how aggressively the balancer protects you from a wall.
+
+The interaction worth remembering is between `threshold` and `draw`: together
+they form the pull's headroom bar (`5h% + draw < threshold`). Raising the
+threshold to ride accounts higher, without also raising `draw`, widens that
+bar and lets the rebalance pull move onto fuller accounts.
 
 ## The refresh-rotation risk, quantified
 
