@@ -78,6 +78,14 @@ there is unimplemented). Python 3.11+, stdlib only.
   token wins — so refreshed tokens are harvested back home and a stale pool
   copy is replaced. A manual `/login` inside a pool session is recognized by
   email and adopted.
+- **Refresh on probe:** only the *installed* account's token stays fresh by
+  being used; an idle pool account's 8-hour access token lapses and would
+  otherwise show `expired` with no usage until its next launch. When a probe
+  meets a lapsed-but-refreshable account it rotates the token in place via the
+  OAuth refresh-token grant (the same one a launch uses), so every account
+  keeps reporting usage. This runs on the network path — the 5-minute fleet
+  pull and `status --refresh` (the tray's Refresh) — never on the tray's
+  passive, cache-only view.
 
 Two rules keep this safe: credentials are **always copied, never symlinked**
 (Claude Code rewrites the file atomically and would replace a symlink), and
