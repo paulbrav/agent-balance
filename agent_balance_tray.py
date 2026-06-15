@@ -106,20 +106,18 @@ def cli() -> str | None:
     return shutil.which("agent-balance")
 
 
-def collect(refresh: bool = False) -> Snapshot:
+def collect() -> Snapshot:
     """Worker-thread data gathering: shell out to `agent-balance status
-    --json` and parse the DATA contract. Default is cache-only (the balancer
-    tick is the machine's only steady poller, so passive redraws add zero
-    load); refresh=True runs `--refresh`, which makes the CLI do a staggered,
-    cooldown-aware fleet sweep server-side. Any failure becomes a Snapshot
-    with .error set so the tray shows an error row instead of crashing."""
+    --json` and parse the DATA contract. Cache-only by design — the balancer
+    tick is the machine's only steady poller, so the tray's passive redraws
+    add zero network load. Any failure becomes a Snapshot with .error set so
+    the tray shows an error row instead of crashing."""
     exe = cli()
     if not exe:
         return Snapshot(error="agent-balance not found on PATH")
-    cmd = [exe, "status", "--json"] + (["--refresh"] if refresh else [])
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=(30 if refresh else 10)
+            [exe, "status", "--json"], capture_output=True, text=True, timeout=10
         )
     except (OSError, subprocess.SubprocessError) as e:
         return Snapshot(error=f"agent-balance failed: {e}")
@@ -160,13 +158,13 @@ class Tray:
             interval = 60
         GLib.timeout_add_seconds(interval, self.refresh)
 
-    def refresh(self, force: bool = False):
-        threading.Thread(target=self._work, args=(force,), daemon=True).start()
+    def refresh(self):
+        threading.Thread(target=self._work, daemon=True).start()
         return True  # keep the GLib timer alive
 
-    def _work(self, force: bool):
+    def _work(self):
         try:
-            snap = collect(force)
+            snap = collect()
         except Exception as e:  # never let a probe hiccup kill the tray
             snap = Snapshot(error=str(e))
         GLib.idle_add(self._update, snap)
@@ -229,38 +227,16 @@ class Tray:
         elif not snap.rows:
             menu.append(self.row_item("no accounts found"))
 
+        # No manual Refresh / Rebalance items: the systemd tick rebalances and
+        # refreshes (usage + token renewal) on its own cadence, and the tray
+        # repaints from that cache below — so both were just "skip the wait"
+        # shortcuts. The tray is a pure viewer; balancing lives in the tick.
         menu.append(Gtk.SeparatorMenuItem())
-        tick = Gtk.MenuItem(label="Rebalance now")
-        tick.connect("activate", self.on_tick)
-        menu.append(tick)
-        refresh = Gtk.MenuItem(label="Refresh")
-        refresh.connect("activate", self.on_refresh)
-        menu.append(refresh)
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", Gtk.main_quit)
         menu.append(quit_item)
         menu.show_all()
         return menu
-
-    def on_tick(self, *_):
-        def run():
-            exe = cli()
-            if exe:
-                subprocess.run([exe, "tick"], capture_output=True)
-                self.refresh()
-            else:
-                # No import fallback by design (Issue 1's no-import rule): off
-                # PATH the tray can't tick — just redraw to surface the error row.
-                self.refresh()
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def on_refresh(self, *_):
-        """Force a real fleet probe (staggered, cooldown-aware), then redraw —
-        unlike the passive redraws, which are cache-only. collect(refresh=True)
-        runs `status --json --refresh`, so probe_fleet's PROBE_SPACING /
-        LIMITED_COOLDOWN / STALE_MAX invariants stay enforced server-side."""
-        self.refresh(force=True)
 
 
 def install_autostart() -> int:

@@ -84,8 +84,8 @@ there is unimplemented). Python 3.11+, stdlib only.
   meets a lapsed-but-refreshable account it rotates the token in place via the
   OAuth refresh-token grant (the same one a launch uses), so every account
   keeps reporting usage. This runs on the network path — the 5-minute fleet
-  pull and `status --refresh` (the tray's Refresh) — never on the tray's
-  passive, cache-only view.
+  pull and a manual `status --refresh` — never on the tray's passive,
+  cache-only view.
 
 Two rules keep this safe: credentials are **always copied, never symlinked**
 (Claude Code rewrites the file atomically and would replace a symlink), and
@@ -187,9 +187,12 @@ lets the pull move onto fuller accounts.
 
 `agent-balance-tray` puts the account table in your system tray: the icon
 label shows the installed account and its 5h usage, and the dropdown renders
-every account's 5h/7d windows as colored bars (the agent-pick `--list` look),
-plus "Rebalance now". It reads the balancer's own probe cache, so it adds no
-API load; the "Refresh" item forces one staggered fleet probe on demand.
+every account's 5h/7d windows as colored bars (the agent-pick `--list` look).
+It's a pure viewer — it reads the balancer's own probe cache and repaints on
+its own timer, so it adds no API load. Rebalancing and data/token refresh are
+the systemd tick's job (every tick, fleet probe every ~5 min), so there are no
+manual buttons; if the table looks stale, check the tick is running with
+`agent-balance status` or `systemctl --user status agent-balance.timer`.
 
 ```bash
 agent-balance-tray                       # foreground
