@@ -13,6 +13,12 @@ requires-python = ">=3.11"
 # below target that floor, not the dev interpreter.
 dependencies = []
 
+[project.optional-dependencies]
+# Dev-only simulation harness extras (sim/ is NOT shipped in the wheel). The
+# core sim is stdlib-only; matplotlib only enables the optional Pareto PNG and
+# is import-guarded so ty/runtime never fail without it.
+sim = ["matplotlib>=3.8"]
+
 [project.urls]
 Repository = "https://github.com/paulbrav/agent-balance"
 
@@ -33,7 +39,7 @@ only-include = ["agent_balance.py", "agent_balance_tray.py"]
 dev = ["pytest>=8", "ruff>=0.14", "ty"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "sim/tests"]
 
 [tool.ruff]
 line-length = 88
@@ -43,7 +49,7 @@ target-version = "py311"
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agent_balance"]
+known-first-party = ["agent_balance", "sim"]
 
 [tool.ruff.lint.per-file-ignores]
 # gi.require_version must run before the gi.repository imports.
