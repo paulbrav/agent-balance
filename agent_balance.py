@@ -1194,7 +1194,8 @@ def tick(
             out("agent-balance: another tick holds the lock, skipping")
             return 0
 
-        gc_leases(cfg)  # reap leases of exited sharded instances
+        live = gc_leases(cfg)  # reap leases of exited sharded instances
+        ledger_throttles(cfg, accounts, now, live)  # log new 429s with n_a
         state = read_state(cfg, now)
         state = harvest(cfg, accounts, state, now, out)
         installed = by_name(accounts, state["installed"])
@@ -1486,6 +1487,99 @@ def scan_throttle_events(
     }
 
 
+def scan_new_throttles(
+    home: Path, since: float, now: float, lookback: int = 86400
+) -> int:
+    """Count THROTTLE_MARKER hits in one account's transcripts whose file mtime
+    is in (since, now] — the NEW 429s since the last scan. Files older than
+    `lookback` are skipped. Read-only and fail-soft. The mtime gate (not a byte
+    cursor — transcripts get rewritten/rotated) is what makes the ledger
+    idempotent: once the per-account seen-epoch is advanced to `now`, a file is
+    re-counted only when Claude Code writes to it again (a new turn / 429)."""
+    hits = 0
+    try:
+        paths = list((home / "projects").rglob("*.jsonl"))
+    except OSError:
+        return 0
+    for p in paths:
+        try:
+            mtime = p.stat().st_mtime
+            if mtime <= since or now - mtime > lookback:
+                continue
+            hits += p.read_text(errors="replace").count(THROTTLE_MARKER)
+        except OSError:
+            continue
+    return hits
+
+
+def record_throttles(
+    cfg: Config, home: Path, name: str, n_a: int, now: float
+) -> int:
+    """Fold one account's NEW transcript 429s into throttle_ledger.jsonl, one
+    row stamped with the current live-instance count n_a, then advance the
+    per-account seen-epoch. Returns the new-hit count. Fail-soft. Reads INSTANCE
+    transcripts ONLY — never the balancer's own <name>.limited usage-probe flag
+    (a different traffic stream, single-overwritten, no concurrency tag: the
+    wrong signal for the throughput knee). On the very first scan it just starts
+    the clock (no backfill of historical 429s, whose n_a is unknown)."""
+    seen_path = cfg.cache / f"{name}.throttle-seen"
+    since = stamp_read(seen_path)
+    if since <= 0:
+        stamp_set(seen_path, now)
+        return 0
+    hits = scan_new_throttles(home, since, now)
+    if hits:
+        row = {"epoch": int(now), "account": name, "n_a": n_a, "hits": hits}
+        append_capped(
+            cfg.cache / "throttle_ledger.jsonl", json.dumps(row), 2000, 1000
+        )
+    stamp_set(seen_path, now)
+    return hits
+
+
+def ledger_throttles(
+    cfg: Config,
+    accounts: list[Account],
+    now: float,
+    leases: dict[int, dict] | None = None,
+) -> None:
+    """For each account, fold new transcript 429s into the throttle ledger,
+    stamped with that account's current live-instance count — turning the
+    censored knee into two-sided-identifiable (account, n_a)-at-429 data. The
+    only writer of the ledger. Reuses an already-GC'd lease map when given (the
+    tick passes its gc_leases result) to avoid a double GC. Never raises."""
+    load = account_load(leases if leases is not None else gc_leases(cfg))
+    for a in accounts:
+        record_throttles(cfg, a.home, a.name, load.get(a.name, 0), now)
+
+
+def read_throttle_ledger(cfg: Config, now: float, window: int = 86400) -> dict:
+    """Recent throttle-ledger summary for the metrics block: rows + total hits
+    within `window`, and the max n_a observed at a 429 — the empirical lower
+    bound on the per-account throughput knee. Fail-soft -> zeros."""
+    rows = hits = max_n_a = 0
+    try:
+        text = (cfg.cache / "throttle_ledger.jsonl").read_text()
+    except OSError:
+        return {"rows": 0, "hits": 0, "max_n_a": 0, "window_s": window}
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        epoch = row.get("epoch")
+        if not isinstance(epoch, (int, float)) or now - epoch > window:
+            continue
+        rows += 1
+        h, n = row.get("hits"), row.get("n_a")
+        hits += int(h) if isinstance(h, (int, float)) else 0
+        if isinstance(n, (int, float)):
+            max_n_a = max(max_n_a, int(n))
+    return {"rows": rows, "hits": hits, "max_n_a": max_n_a, "window_s": window}
+
+
 def swap_churn(cfg: Config, now: float, ttl: int, window: int = 86400) -> dict:
     """From the swap log: swaps in the recent `window`, and how many landed
     within `ttl` of the prior swap — a cache-warmth-bust proxy, since
@@ -1520,6 +1614,7 @@ def gather_metrics(cfg: Config, accounts: list[Account], now: float) -> dict:
     sessions under a wholly custom CLAUDE_CONFIG_DIR are not.)"""
     return {
         "throttle_events": scan_throttle_events([a.home for a in accounts], now),
+        "throttle_ledger": read_throttle_ledger(cfg, now),
         "swaps": swap_churn(cfg, now, cfg.cache_ttl),
         "pool_session_age_s": pool_session_age(cfg, now),
     }
@@ -1590,11 +1685,17 @@ def format_metrics_line(metrics: dict, now: float) -> str:
         sess = f"active {age / 60:.0f}m ago" if age >= 60 else "active now"
     else:
         sess = "idle"
+    tl = metrics.get("throttle_ledger") or {}
+    ledger = (
+        f" · ledger {tl.get('hits', 0)} 429s (n_a≤{tl.get('max_n_a', 0)})"
+        if tl.get("rows")
+        else ""
+    )
     return (
         f"throttle: {te.get('recent', 0)} rate-limit hits in {win_m}m "
         f"({te.get('total', 0)} in {look_h}h) · "
         f"swaps {sw.get('recent', 0)} in 24h ({sw.get('warm_busts', 0)} "
-        f"cache-warm) · pool session {sess}"
+        f"cache-warm) · pool session {sess}{ledger}"
     )
 
 
