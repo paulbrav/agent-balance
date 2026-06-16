@@ -25,7 +25,12 @@ def routed(cfg, monkeypatch):
         ab, "cmd_uninstall", lambda c: calls.append(("uninstall", c)) or 0
     )
     monkeypatch.setattr(
-        ab, "cmd_launch", lambda c, a, **k: calls.append(("launch", a)) or 0
+        ab, "cmd_launch", lambda c, a, **k: calls.append(("launch", a, k)) or 0
+    )
+    monkeypatch.setattr(
+        ab,
+        "cmd_bench",
+        lambda c, prompt, n, names, **k: calls.append(("bench", names, k)) or 0,
     )
     # Default to Linux so the guard tests can opt into darwin explicitly.
     monkeypatch.setattr(ab.sys, "platform", "linux")
@@ -55,12 +60,24 @@ def test_launch_passes_remainder(routed):
     # first) on Python 3.11..3.14 alike — `launch -- -p hi` is the escape
     # hatch for that case (asserted below).
     assert ab.main(["launch", "chat", "-p", "hi"]) == 0
-    assert routed == [("launch", ["chat", "-p", "hi"])]
+    assert routed == [("launch", ["chat", "-p", "hi"], {"shard": False})]
 
 
 def test_launch_double_dash_escapes_leading_flag(routed):
     assert ab.main(["launch", "--", "-p", "hi"]) == 0
-    assert routed == [("launch", ["--", "-p", "hi"])]
+    assert routed == [("launch", ["--", "-p", "hi"], {"shard": False})]
+
+
+def test_launch_shard_passes_kwarg(routed):
+    assert ab.main(["launch", "--shard", "--", "-p", "hi"]) == 0
+    assert routed == [("launch", ["--", "-p", "hi"], {"shard": True})]
+
+
+def test_bench_routes_accounts_and_ramp(routed):
+    assert ab.main(
+        ["bench", "--accounts", "a, b", "--ramp", "--ramp-account", "x"]
+    ) == 0
+    assert routed == [("bench", ["a", "b"], {"ramp": True, "ramp_account": "x"})]
 
 
 def test_claude_argv_strips_one_leading_dashdash():

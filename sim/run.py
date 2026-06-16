@@ -42,18 +42,21 @@ def cmd_gate(args: argparse.Namespace) -> int:
     print(f"  unique 429 incidents: {res.n_429}")
     inst_ok = res.installed_share >= facevalidity.INSTALLED_SHARE_MIN
     print(
-        f"  (i)   installed-share: {res.installed_share * 100:5.1f}% "
+        f"  (i)   managed installed: {res.installed_share * 100:5.1f}% "
         f"(need >= {facevalidity.INSTALLED_SHARE_MIN * 100:.0f}%) "
         f"-> {'PASS' if inst_ok else 'FAIL'}"
     )
+    cover_floor = max(1, int(facevalidity.COVERAGE_MIN_FRAC * res.n_429))
     band_ok = (
-        res.n_band_covered > 0
+        res.n_band_covered >= cover_floor
+        and res.n_band_covered > 0
         and res.decoupled_share >= facevalidity.DECOUPLED_SHARE_MIN
     )
     print(
         f"  (ii)  decoupled (<{facevalidity.WALL:.0f}% 5h): "
-        f"{res.decoupled_share * 100:5.1f}% of {res.n_band_covered} covered "
-        f"(need >= {facevalidity.DECOUPLED_SHARE_MIN * 100:.0f}%; "
+        f"{res.decoupled_share * 100:5.1f}% of {res.n_band_covered}/{res.n_429} "
+        f"covered (need >= {facevalidity.DECOUPLED_SHARE_MIN * 100:.0f}% and "
+        f">= {facevalidity.COVERAGE_MIN_FRAC:.0%} coverage; "
         f"{res.band_share * 100:.0f}% in tight 8-23% band) "
         f"-> {'PASS' if band_ok else 'FAIL'}"
     )

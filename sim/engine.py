@@ -199,20 +199,23 @@ class Engine:
 
     def _on_throttle(self, ev: Event) -> None:
         # For each account, demand = ON instances x fanout vs the knee k_a.
+        # CRN: draw ONE hazard number per account in a load-INDEPENDENT order
+        # (sorted names), unconditionally, so the shared 'hazard' stream advances
+        # identically across policies — only the p-threshold differs by routing.
         rng = self.seeds.stream("hazard")
-        for name, st in self.world.accounts.items():
+        for name in sorted(self.world.accounts):
+            st = self.world.accounts[name]
             on_insts = [
                 i
                 for i in self.world.instances.values()
                 if i.account == name and i.on
             ]
+            r = rng.random()  # consumed every account, every THROTTLE (CRN)
             if not on_insts:
                 continue
             dmd = tokenbucket.account_demand(len(on_insts), self.scn.fanout)
             p = tokenbucket.throttle_prob(dmd, st.k_a, BUCKET_MIN)
-            if p <= 0:
-                continue
-            if rng.random() < p:
+            if p > 0 and r < p:
                 # A 429 burst: every ON instance on this account stalls for the
                 # slice. Charge throttled-seconds and reclaim the goodput that
                 # _on_bucket optimistically credited.

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from sim import prod
+from sim import prod, tokenbucket
 from sim.state import WorldState
 
 
@@ -129,9 +129,12 @@ class PureUrgencyConcentrate:
 class OracleOffline:
     """An upper-bound reference, NOT a deployable policy: it sees the TRUE live
     load and routes to the least-loaded account that still has knee headroom
-    (k_a), falling back to least-loaded. With perfect concurrency information it
-    never knowingly oversubscribes a finite bucket — the best a load-only
-    allocator could do, bounding how much the real policies leave on the table."""
+    (k_a), falling back to least-loaded. Headroom is tested against the SAME 429
+    hazard the engine uses — account_demand(on, fanout) vs k_a — so with fanout
+    > 1 it admits only while ON*fanout stays under the bucket. With perfect
+    concurrency information it never knowingly oversubscribes a finite bucket —
+    the best a load-only allocator could do, bounding how much the real policies
+    leave on the table."""
 
     name = "OracleOffline"
 
@@ -141,12 +144,16 @@ class OracleOffline:
         under = []
         for a in accounts:
             st = world.accounts[a.name]
-            on = sum(
-                1
-                for i in world.instances.values()
+            on_insts = [
+                i for i in world.instances.values()
                 if i.account == a.name and i.on
-            )
-            if on < st.k_a:  # still has per-minute headroom (k_a may be inf)
+            ]
+            # Derive fanout from an ON instance (engine stamps scn.fanout on it);
+            # default 1.0 when this account has none ON yet.
+            fanout = on_insts[0].fanout if on_insts else 1.0
+            # Admit only if one MORE ON instance would still not exceed the knee
+            # under the engine's demand = ON*fanout hazard (k_a may be inf).
+            if tokenbucket.account_demand(len(on_insts) + 1, fanout) <= st.k_a:
                 under.append(a)
         pool = under or accounts
         return min(pool, key=lambda a: (load.get(a.name, 0), a.name)).name

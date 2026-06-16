@@ -73,9 +73,10 @@ WEEK = 7 * 86400
 # holds off while a pool session was active within CACHE_TTL; an imminent 5h
 # wall ("roll") or a dead token ("hard") still swaps, cache be damned.
 CACHE_TTL = 300
-# Sharding's per-account concurrency cap k_a: how many live instances to
-# water-fill onto one account before spilling to the next — an estimate of its
-# per-minute bucket "knee" in instances. The ramp bench measured the knee >10 on
+# Sharding's per-account concurrency KNEE k_a: an estimate of one account's
+# per-minute bucket knee in instances. The allocator water-fills to only
+# int(SPILL_ALPHA * this) live instances before spilling to the next (default
+# 6 -> int(0.75*6)=4 cold-start spill). The ramp bench measured the knee >10 on
 # one account, so this cold-start default is deliberately conservative (spreads
 # a little early, costing some cache warmth, but never saturates). Tune via
 # AGENT_BALANCE_INSTANCES_PER_ACCOUNT or per-account in caps.json (seeded from
@@ -1490,6 +1491,30 @@ def read_swap_tail(cfg: Config) -> list[str]:
 THROTTLE_MARKER = "Server is temporarily limiting requests"
 
 
+def _walk_jsonl(root: Path):
+    """Yield (Path, mtime) for every *.jsonl under `root`, getting mtime from
+    the cached scandir DirEntry — one stat per directory pass, not one per file
+    (the old rglob + p.stat()). The mtime gate still skips reading stale files;
+    this only cuts the per-tick syscall cost of the tree walk. Fail-soft: an
+    unreadable directory is skipped, never raised."""
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                    elif entry.name.endswith(".jsonl"):
+                        yield Path(entry.path), entry.stat().st_mtime
+                except OSError:
+                    continue
+
+
 def scan_throttle_events(
     homes: list[Path], now: float, window: int = 3600, lookback: int = 86400
 ) -> dict:
@@ -1511,13 +1536,8 @@ def scan_throttle_events(
         if resolved in seen:
             continue
         seen.add(resolved)
-        try:
-            paths = list(proj.rglob("*.jsonl"))
-        except OSError:
-            continue
-        for p in paths:
+        for p, mtime in _walk_jsonl(proj):
             try:
-                mtime = p.stat().st_mtime
                 if now - mtime > lookback:
                     continue
                 hits = p.read_text(errors="replace").count(THROTTLE_MARKER)
@@ -1537,28 +1557,50 @@ def scan_throttle_events(
     }
 
 
+def _line_epoch(line: str) -> float | None:
+    """The transcript line's own `timestamp` (ISO-8601) as an epoch, or None
+    when the line isn't a JSON object with a parseable timestamp. Fail-soft —
+    a non-JSON line or a substring-only marker yields None (no per-line gate)."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    ts = obj.get("timestamp")
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def scan_new_throttles(
     home: Path, since: float, now: float, lookback: int = 86400
 ) -> int:
-    """Count THROTTLE_MARKER hits in one account's transcripts whose file mtime
-    is in (since, now] — the NEW 429s since the last scan. Files older than
-    `lookback` are skipped. Read-only and fail-soft. The mtime gate (not a byte
-    cursor — transcripts get rewritten/rotated) is what makes the ledger
-    idempotent: once the per-account seen-epoch is advanced to `now`, a file is
-    re-counted only when Claude Code writes to it again (a new turn / 429)."""
+    """Count THROTTLE_MARKER hits in one account's transcripts that are NEW
+    since the last scan. Files older than `lookback` are skipped by mtime; then
+    each marker LINE is counted only if its own `timestamp` is in (since, now].
+    Per-line gating is what makes the ledger idempotent against APPEND-ONLY
+    transcripts: a later normal turn advances file mtime but does not re-count
+    the old 429, because the 429 line's timestamp is <= since. A marker line
+    without a parseable timestamp falls back to the file-mtime gate (counted,
+    since the file as a whole is newer than since). Read-only and fail-soft."""
     hits = 0
-    try:
-        paths = list((home / "projects").rglob("*.jsonl"))
-    except OSError:
-        return 0
-    for p in paths:
+    for p, mtime in _walk_jsonl(home / "projects"):
         try:
-            mtime = p.stat().st_mtime
             if mtime <= since or now - mtime > lookback:
                 continue
-            hits += p.read_text(errors="replace").count(THROTTLE_MARKER)
+            text = p.read_text(errors="replace")
         except OSError:
             continue
+        for line in text.splitlines():
+            if THROTTLE_MARKER not in line:
+                continue
+            ep = _line_epoch(line)
+            if ep is None or since < ep <= now:
+                hits += 1
     return hits
 
 
@@ -1566,18 +1608,24 @@ def record_throttles(
     cfg: Config, home: Path, name: str, n_a: int, now: float
 ) -> int:
     """Fold one account's NEW transcript 429s into throttle_ledger.jsonl, one
-    row stamped with the current live-instance count n_a, then advance the
-    per-account seen-epoch. Returns the new-hit count. Fail-soft. Reads INSTANCE
-    transcripts ONLY — never the balancer's own <name>.limited usage-probe flag
-    (a different traffic stream, single-overwritten, no concurrency tag: the
-    wrong signal for the throughput knee). On the very first scan it just starts
-    the clock (no backfill of historical 429s, whose n_a is unknown)."""
+    row stamped with n_a = the live-instance count at THIS scan tick (an
+    approximation of the concurrency at the 429 — the per-line concurrency is
+    unrecoverable), then advance the per-account seen-epoch. Returns the new-hit
+    count. Fail-soft. Reads INSTANCE transcripts ONLY — never the balancer's own
+    <name>.limited usage-probe flag (a different traffic stream,
+    single-overwritten, no concurrency tag: the wrong signal for the throughput
+    knee). On the very first scan it just starts the clock (no backfill of
+    historical 429s, whose n_a is unknown)."""
     seen_path = cfg.cache / f"{name}.throttle-seen"
     since = stamp_read(seen_path)
     if since <= 0:
         stamp_set(seen_path, now)
         return 0
-    hits = scan_new_throttles(home, since, now)
+    # Cover the whole (since, now] gap: if a tick was missed for > the default
+    # lookback, a transcript modified inside the legitimate window must not be
+    # clipped by the mtime lookback gate before seen advances to now.
+    lookback = max(86400, int(now - since))
+    hits = scan_new_throttles(home, since, now, lookback)
     if hits:
         row = {"epoch": int(now), "account": name, "n_a": n_a, "hits": hits}
         append_capped(
@@ -1605,12 +1653,13 @@ def ledger_throttles(
 
 def read_throttle_ledger(cfg: Config, now: float, window: int = 86400) -> dict:
     """Recent throttle-ledger summary for the metrics block: rows + total hits
-    within `window`, and the max n_a observed at a 429 — the empirical lower
-    bound on the per-account throughput knee. Fail-soft -> zeros."""
+    within `window`, and the max n_a stamped on a 429 row — a NOISY estimate of
+    the per-account throughput knee (n_a is the concurrency at the scanning
+    tick, not at the 429), not a hard lower bound. Fail-soft -> zeros."""
     rows = hits = max_n_a = 0
     try:
         text = (cfg.cache / "throttle_ledger.jsonl").read_text()
-    except OSError:
+    except (OSError, ValueError):
         return {"rows": 0, "hits": 0, "max_n_a": 0, "window_s": window}
     for line in text.splitlines():
         try:
@@ -1641,7 +1690,7 @@ def swap_churn(cfg: Config, now: float, ttl: int, window: int = 86400) -> dict:
                 epochs.append(int(line.split()[0]))
             except (ValueError, IndexError):
                 continue
-    except OSError:
+    except (OSError, ValueError):
         return {"recent": 0, "warm_busts": 0, "ttl_s": ttl, "window_s": window}
     epochs.sort()
     recent = busts = 0
@@ -2179,7 +2228,11 @@ def ramp_target(
         return by_name(accounts, name)
     if not accounts:
         return None
-    load = account_load(gc_leases(cfg))
+    # Read-only: ramp only needs current load, not reaping. gc_leases() here
+    # would write_leases() OUTSIDE the BalancerLock, racing tick()/launch's
+    # locked writers (a rare manual bench could clobber a just-added lease). A
+    # few stale dead-PID entries only marginally bias the least-loaded pick.
+    load = account_load(read_leases(cfg))
     return min(accounts, key=lambda a: (load.get(a.name, 0), a.name))
 
 
@@ -2320,10 +2373,16 @@ def main(argv: list[str] | None = None) -> int:
     bench_p.add_argument(
         "--ramp",
         action="store_true",
-        help="ramp 2..10 concurrent on ONE account to find its 429 knee "
+        help="ramp 2,4,6,8,10 concurrent on ONE account to find its 429 knee "
         "(spends real tokens, burns that account's 5h window)",
     )
-    bench_p.add_argument("--ramp-account", default=None, dest="ramp_account")
+    bench_p.add_argument(
+        "--ramp-account",
+        default=None,
+        dest="ramp_account",
+        help="account name to ramp (default: first --accounts name, "
+        "else the least-loaded idle account)",
+    )
 
     ns = parser.parse_args(argv)
     cfg = make_config()

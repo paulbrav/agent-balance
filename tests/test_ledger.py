@@ -16,6 +16,27 @@ def write_marker(home, mtime, count=1):
     os.utime(f, (mtime, mtime))
 
 
+def _iso(epoch):
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(epoch, UTC).isoformat()
+
+
+def append_turn(home, mtime, *, throttle=False, epoch=None):
+    """Append ONE real-shaped transcript line (a 429 or a normal turn) and
+    advance the file mtime — models Claude Code's append-only transcripts."""
+    f = home / "projects" / "p" / "s.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    text = ab.THROTTLE_MARKER + " (not your usage limit)" if throttle else "ok"
+    line = json.dumps(
+        {"type": "assistant", "timestamp": _iso(mtime if epoch is None else epoch),
+         "message": {"content": [{"type": "text", "text": text}]}}
+    )
+    with f.open("a") as fh:
+        fh.write(line + "\n")
+    os.utime(f, (mtime, mtime))
+
+
 def ledger_rows(cfg):
     p = cfg.cache / "throttle_ledger.jsonl"
     if not p.exists():
@@ -60,6 +81,29 @@ def test_ledger_counts_new_hits_after_retouch(cfg):
     rows = ledger_rows(cfg)
     assert len(rows) == 2
     assert rows[1]["n_a"] == 2
+
+
+def test_appended_normal_turn_does_not_recount_old_429(cfg):
+    # The bug: an append-only transcript advances mtime on a NORMAL turn, and a
+    # whole-file count would re-credit the old 429 every tick. Per-line
+    # timestamp gating must count the 429 once and ignore later turns.
+    home = add_account(cfg, "alt1")
+    seed_seen(cfg, "alt1", NOW - 1000)
+    append_turn(home, NOW - 100, throttle=True)  # one real 429 at NOW-100
+    assert ab.record_throttles(cfg, home, "alt1", 1, NOW) == 1
+    append_turn(home, NOW + 50, throttle=False)  # a later normal turn (no 429)
+    assert ab.scan_new_throttles(home, NOW, NOW + 50) == 0  # old 429 not recounted
+    assert ab.record_throttles(cfg, home, "alt1", 5, NOW + 50) == 0
+    assert len(ledger_rows(cfg)) == 1  # still just the one true 429
+
+
+def test_scan_counts_each_timestamped_429_once(cfg):
+    home = add_account(cfg, "alt1")
+    seed_seen(cfg, "alt1", NOW - 1000)
+    append_turn(home, NOW - 100, throttle=True)
+    append_turn(home, NOW - 50, throttle=True)  # a second, genuinely new 429
+    assert ab.scan_new_throttles(home, NOW - 1000, NOW) == 2
+    assert ab.scan_new_throttles(home, NOW - 75, NOW) == 1  # only the newer one
 
 
 def test_first_scan_starts_clock_no_backfill(cfg):
@@ -116,6 +160,36 @@ def test_read_throttle_ledger_summary(cfg):
     assert s["rows"] == 2  # the ancient row is outside the 24h window
     assert s["hits"] == 4
     assert s["max_n_a"] == 5
+
+
+def test_read_throttle_ledger_skips_malformed_rows(cfg):
+    cfg.cache.mkdir(parents=True)
+    (cfg.cache / "throttle_ledger.jsonl").write_text(
+        "not json at all\n"
+        + json.dumps([1, 2])  # JSON but not a dict
+        + "\n"
+        + json.dumps({"epoch": "x", "n_a": "y", "hits": "z"})  # string fields
+        + "\n"
+        + json.dumps({"epoch": NOW - 10, "account": "a", "n_a": 3, "hits": 2})
+        + "\n"
+    )
+    s = ab.read_throttle_ledger(cfg, NOW)
+    assert s["rows"] == 1 and s["hits"] == 2 and s["max_n_a"] == 3
+
+
+def test_read_throttle_ledger_failsoft_non_utf8(cfg):
+    cfg.cache.mkdir(parents=True)
+    (cfg.cache / "throttle_ledger.jsonl").write_bytes(b"\xff\xfe garbage")
+    assert ab.read_throttle_ledger(cfg, NOW) == {
+        "rows": 0, "hits": 0, "max_n_a": 0, "window_s": 86400
+    }
+
+
+def test_swap_churn_failsoft_non_utf8(cfg):
+    cfg.cache.mkdir(parents=True)
+    (cfg.cache / "swaps").write_bytes(b"\xff\xfe garbage")
+    s = ab.swap_churn(cfg, NOW, 300)
+    assert s["recent"] == 0 and s["warm_busts"] == 0
 
 
 def test_format_metrics_line_shows_ledger():

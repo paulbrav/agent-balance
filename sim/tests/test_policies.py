@@ -95,3 +95,18 @@ def test_oracle_routes_to_headroom():
     load = world.load()
     choice = OracleOffline().choose(world, stats, load, NOW)
     assert choice != "main"  # main is over its knee; oracle picks headroom
+
+
+def test_oracle_respects_fanout_in_headroom():
+    # With fanout=4 and k_a=8 the engine sheds at 3 ON instances (12 > 8), so the
+    # oracle must treat an account already at 2 ON as having NO headroom (raw
+    # on=2 < k_a=8 would wrongly admit it). main has 2 ON @ fanout 4 -> avoid.
+    world = _world()
+    for st in world.accounts.values():
+        st.k_a = 8.0
+    for iid in range(1, 3):
+        world.add_instance(Instance(iid, "main", NOW, 100.0, on=True, fanout=4.0))
+    stats = _stats(world, NOW)
+    load = world.load()
+    choice = OracleOffline().choose(world, stats, load, NOW)
+    assert choice != "main"  # 2*4=8 already at the knee; a 3rd would shed

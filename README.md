@@ -145,9 +145,11 @@ things:
   shares); the fix is **spatial** — pin different instances to different
   accounts at launch so several buckets work at once.
 
-`agent-balance launch --shard` pins each instance for life to the least-loaded
-feasible account (its own bucket + a warm prompt cache, no churn), water-filling
-by the same `urgency()` index up to a per-account knee, then spilling. To make
+`agent-balance launch --shard` pins each instance for life to the
+highest-urgency feasible account that still has per-minute bucket headroom (its
+own bucket + a warm prompt cache, no churn), water-filling by the `urgency()`
+index up to a per-account knee, then spilling to the next (falling back to the
+least-loaded account only once every feasible account is at its knee). To make
 bare `claude` auto-shard, replace the pool export with a wrapper function:
 
 ```bash
@@ -161,10 +163,13 @@ agent-balance bench                       # 1-vs-N tokens/sec across accounts
 agent-balance bench --ramp --ramp-account alt1   # find an account's 429 knee
 ```
 
-The per-account knee lives in `~/.cache/agent-balance/caps.json` (seed it from
-`bench --ramp`); the balancer also logs real instance 429s with the live
-concurrency to `throttle_ledger.jsonl` (surfaced in `status --json`), turning
-the unobserved knee into data. The single-account subagent fan-out inside one
+The per-account knee lives in `~/.cache/agent-balance/caps.json` (seed it with
+the RAW measured knee from `bench --ramp` — the allocator water-fills to only
+~75% of it, `SPILL_ALPHA` early-spill headroom, so a seeded knee of `8`
+water-fills `6` live instances before spilling; do not pre-shrink the value).
+The balancer also logs real instance 429s with the live concurrency to
+`throttle_ledger.jsonl` (surfaced in `status --json`), turning the unobserved
+knee into data. The single-account subagent fan-out inside one
 instance cannot be split — sharding spreads *instances*, never the subagents
 inside one. A backtest of the allocation policy on your real logs lives in the
 dev-only `sim/` tree (`python -m sim.run gate|experiment`, not shipped).
@@ -179,7 +184,7 @@ Tuning (env vars, also honored by the systemd unit if set at install time):
 | `AGENT_BALANCE_DRAW` | `10` | 5h points a typical session is assumed to need (feasibility gate) |
 | `AGENT_BALANCE_PULL_MARGIN` | `10` | rebalance pull: proactively swap when another account's urgency (required %/day) beats the installed one's by this margin (`0` disables) |
 | `AGENT_BALANCE_CACHE_TTL` | `300` | a discretionary (rebalance) swap is held off while a pool session was active within this many seconds, to keep its prompt cache warm |
-| `AGENT_BALANCE_INSTANCES_PER_ACCOUNT` | `6` | `--shard` cold-start cap: live instances water-filled onto one account before spilling (per-account knees in `caps.json` override) |
+| `AGENT_BALANCE_INSTANCES_PER_ACCOUNT` | `6` | `--shard` cold-start KNEE; the allocator water-fills to `int(SPILL_ALPHA × this)` = `4` live instances onto one account before spilling (per-account knees in `caps.json` override) |
 | `AGENT_PICK_ROOT` | `~/.claude-accounts` | accounts root, shared with agent-pick |
 
 ### Tuning the knobs

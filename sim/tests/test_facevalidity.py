@@ -53,3 +53,24 @@ def test_429s_at_wall_go_directional():
     assert res.installed_share == 1.0
     assert res.decoupled_share == 0.0  # none below the wall
     assert not res.passed
+
+
+def test_low_coverage_does_not_certify():
+    # One late 429 is covered (and decoupled), but most 429s predate any
+    # history. A 100% decoupled_share on a 1-of-N subset must NOT certify (ii).
+    hist = [(1000, 95.0), (1060, 96.0), (1120, 10.0)]  # has a reset, late start
+    accounts = {"main": AccountState("main")}
+    fits = {"main": fit_demand(hist)}
+    # nine 429s before history starts (uncovered) + one covered & decoupled.
+    throttles = [float(t) for t in range(10, 100, 10)] + [1120.0]
+    cal = Calibration(
+        accounts=accounts,
+        fits=fits,
+        swaps=[Swap(0, "unknown", "main")],
+        throttle_epochs=throttles,
+        history={"main": hist},
+    )
+    res = evaluate(cal)
+    assert res.n_band_covered == 1 and res.n_429 == 10  # only the last covered
+    assert res.decoupled_share == 1.0  # the one covered 429 IS below the wall
+    assert not res.passed  # but coverage is 1/10 < 50% -> not certified

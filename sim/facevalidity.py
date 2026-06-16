@@ -3,12 +3,16 @@
 # Before any policy comparison is allowed to claim a winner, three falsifiable
 # checks must hold against the REAL swaps + 429 + history timelines:
 #
-#   (i)   >= 80% of 429s landed on whatever account was INSTALLED at the time
-#         (throttling tracks the installed account, as a per-account knee must).
+#   (i)   >= 80% of 429s landed while a MANAGED account was installed (the 429
+#         records carry no per-account label, so this confirms a managed account
+#         was installed throughout the storm — a sequencing precondition — not
+#         that throttling tracks one specific account).
 #   (ii)  most 429s occurred at a 5h utilization in the 8-23% band — i.e. the
 #         throttle is DECOUPLED from the 5h quota wall (a throughput knee, not a
 #         usage limit). Only 429s whose installed account has history coverage
-#         can be checked; the rest are reported as uncovered.
+#         can be checked; if too FEW are covered (< COVERAGE_MIN_FRAC of all
+#         429s) the check cannot certify, since a high decoupled-share on a tiny
+#         covered subset is not evidence about the storm as a whole.
 #   (iii) the .history sawtooth actually RESETS at r5 (a 5h window rollover is
 #         visible as a large drop), confirming the burn/reset model's shape.
 #
@@ -30,6 +34,9 @@ UTIL_HI = 23.0
 WALL = 50.0  # "near the quota wall" begins here; a decoupled 429 stays below it
 INSTALLED_SHARE_MIN = 0.80  # >= this fraction of 429s on the installed account
 DECOUPLED_SHARE_MIN = 0.75  # >= this fraction of covered 429s below WALL
+COVERAGE_MIN_FRAC = 0.5  # >= this fraction of 429s must have history coverage,
+# else (ii) is unverifiable: a high decoupled_share on a 1-of-100 covered subset
+# is not evidence the storm was decoupled from the quota wall.
 DROP_MIN = 10.0  # a 5h reset shows up as at least this big a downward step
 
 
@@ -112,18 +119,28 @@ def evaluate(cal: Calibration) -> GateResult:
             decoupled += 1
     band_share = in_band / covered if covered else 0.0
     decoupled_share = decoupled / covered if covered else 0.0
+    cover_floor = max(1, int(COVERAGE_MIN_FRAC * n)) if n else 0
     if covered < n:
         notes.append(
             f"{n - covered}/{n} 429s predate any .history coverage "
             "(history is short — band checked on the covered subset only)"
         )
+    if n and covered < cover_floor:
+        notes.append(
+            f"only {covered}/{n} 429s have history coverage "
+            f"(< {COVERAGE_MIN_FRAC:.0%}) — (ii) cannot be certified"
+        )
 
-    # (iii) the sawtooth resets at r5 (a visible drop) on the active accounts.
+    # (iii) the sawtooth resets at r5 (a visible drop) across all accounts.
     total_resets = sum(_count_resets(hist) for hist in cal.history.values())
     saw_reset = total_resets > 0
 
     check_i = n > 0 and installed_share >= INSTALLED_SHARE_MIN
-    check_ii = covered > 0 and decoupled_share >= DECOUPLED_SHARE_MIN
+    check_ii = (
+        covered >= cover_floor
+        and covered > 0
+        and decoupled_share >= DECOUPLED_SHARE_MIN
+    )
     check_iii = saw_reset
     if n == 0:
         notes.append("no 429 incidents found — cannot confirm the throttle model")

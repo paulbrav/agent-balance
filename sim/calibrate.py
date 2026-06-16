@@ -32,7 +32,7 @@ def read_history(path: Path) -> list[tuple[int, float]]:
     out: list[tuple[int, float]] = []
     try:
         text = path.read_text()
-    except OSError:
+    except (OSError, ValueError):
         return out
     for line in text.splitlines():
         parts = line.split()
@@ -70,7 +70,7 @@ def read_swaps(path: Path) -> list[Swap]:
     out: list[Swap] = []
     try:
         text = path.read_text()
-    except OSError:
+    except (OSError, ValueError):
         return out
     for line in text.splitlines():
         parts = line.split()
