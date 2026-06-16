@@ -25,7 +25,7 @@ def routed(cfg, monkeypatch):
         ab, "cmd_uninstall", lambda c: calls.append(("uninstall", c)) or 0
     )
     monkeypatch.setattr(
-        ab, "cmd_launch", lambda c, a: calls.append(("launch", a)) or 0
+        ab, "cmd_launch", lambda c, a, **k: calls.append(("launch", a)) or 0
     )
     # Default to Linux so the guard tests can opt into darwin explicitly.
     monkeypatch.setattr(ab.sys, "platform", "linux")
@@ -61,6 +61,16 @@ def test_launch_passes_remainder(routed):
 def test_launch_double_dash_escapes_leading_flag(routed):
     assert ab.main(["launch", "--", "-p", "hi"]) == 0
     assert routed == [("launch", ["--", "-p", "hi"])]
+
+
+def test_claude_argv_strips_one_leading_dashdash():
+    # The shell wrapper passes `-- "$@"`; launch drops exactly one leading `--`
+    # so claude's own flags survive.
+    assert ab.claude_argv(["--", "-p", "hi"]) == ["claude", "-p", "hi"]
+    assert ab.claude_argv(["--"]) == ["claude"]
+    assert ab.claude_argv([]) == ["claude"]
+    assert ab.claude_argv(["chat"]) == ["claude", "chat"]
+    assert ab.claude_argv(["--", "--"]) == ["claude", "--"]  # only one stripped
 
 
 def test_unknown_command_errors(routed):

@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fcntl
 import hashlib
 import json
@@ -38,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict
@@ -65,6 +66,21 @@ USAGE_TTL = 45  # seconds a successful usage probe stays cached
 USAGE_STALE_AFTER = 2 * USAGE_TTL  # age before status renderers flag the data
 RESET_SOON = 900  # a 5h window resetting within this is treated as open
 WEEK = 7 * 86400
+# The prompt cache is account-scoped with a ~5-minute TTL refreshed on each
+# turn. A discretionary (rebalance) swap inside this window busts a warm
+# session's cache, re-billing its whole prefix — incl. prior thinking blocks —
+# as fresh input (extra quota burn + prefill latency). The soft-swap guard
+# holds off while a pool session was active within CACHE_TTL; an imminent 5h
+# wall ("roll") or a dead token ("hard") still swaps, cache be damned.
+CACHE_TTL = 300
+# Sharding's per-account concurrency cap k_a: how many live instances to
+# water-fill onto one account before spilling to the next — an estimate of its
+# per-minute bucket "knee" in instances. The bench showed 6 concurrent moderate
+# calls on one account do NOT throttle, so the real knee is >6; this default is
+# deliberately conservative (spreads a little early, costing some cache warmth,
+# but never saturates). Tune via AGENT_BALANCE_INSTANCES_PER_ACCOUNT; a later
+# AIMD loop can adjust it per-account from the observed 429 rate.
+INSTANCES_PER_ACCOUNT = 6
 
 
 # ---------------------------------------------------------------- config ---
@@ -80,6 +96,10 @@ class Config:
     draw: float  # 5h points a typical session is assumed to consume
     pull_margin: float  # proactive swap when another account's urgency
     #                     (%/day) beats the installed one's by this (0 = off)
+    cache_ttl: int = CACHE_TTL  # hold off discretionary swaps while a pool
+    #                             session was active within this many seconds
+    instances_per_account: int = INSTANCES_PER_ACCOUNT  # sharding water-fill
+    #                             cap k_a (live instances) before spilling
 
     @property
     def pool(self) -> Path:
@@ -106,6 +126,8 @@ ENV_KEYS = (
     "AGENT_BALANCE_INTERVAL",
     "AGENT_BALANCE_DRAW",
     "AGENT_BALANCE_PULL_MARGIN",
+    "AGENT_BALANCE_CACHE_TTL",
+    "AGENT_BALANCE_INSTANCES_PER_ACCOUNT",
 )
 
 
@@ -135,6 +157,10 @@ def make_config(env: Mapping[str, str] | None = None) -> Config:
         interval=int(num("AGENT_BALANCE_INTERVAL", 60)),
         draw=num("AGENT_BALANCE_DRAW", 10),
         pull_margin=num("AGENT_BALANCE_PULL_MARGIN", 10),
+        cache_ttl=int(num("AGENT_BALANCE_CACHE_TTL", CACHE_TTL)),
+        instances_per_account=int(
+            num("AGENT_BALANCE_INSTANCES_PER_ACCOUNT", INSTANCES_PER_ACCOUNT)
+        ),
     )
 
 
@@ -611,7 +637,7 @@ class Candidate(NamedTuple):
 
 def candidates(
     accounts: list[Account],
-    stats: dict[str, ProbeResult],
+    stats: Mapping[str, object],
     exclude: str | None,
     now: float,
     cfg: Config,
@@ -677,6 +703,53 @@ def pick_pull_target(
     if best is None or best.urgency < u_inst + max(cfg.pull_margin, 0.15 * u_inst):
         return None
     return best.account, best.urgency, u_inst
+
+
+def pick_shard_target(
+    accounts: list[Account],
+    stats: Mapping[str, object],
+    load: Mapping[str, int],
+    cap: int,
+    now: float,
+    cfg: Config,
+) -> Account | None:
+    """The sharding allocator: WATER-FILLING. Among feasible accounts, prefer
+    the highest-urgency one that still has per-minute bucket headroom (fewer
+    than `cap` live instances) — so load fills the most-urgent account up to
+    its knee, then spills to the next, burning weekly allowances in urgency
+    order while never saturating one bucket and spreading only as much as
+    needed (minimal cache fragmentation). When every feasible account is at
+    cap, fall back to the least-loaded one so an extra instance still lands on
+    the emptiest bucket. None when no account is feasible (the caller then
+    falls back to a blind least-loaded pick)."""
+    feas = [c for c in candidates(accounts, stats, None, now, cfg) if c.feasible]
+    if not feas:
+        return None
+    under = [c for c in feas if load.get(c.account.name, 0) < cap]
+    if under:
+        return max(under, key=lambda c: rank(c, now)).account
+    return min(
+        feas, key=lambda c: (load.get(c.account.name, 0), -c.urgency, c.account.name)
+    ).account
+
+
+def choose_shard_account(
+    cfg: Config, accounts: list[Account], now: float
+) -> Account:
+    """Pick the account for a launching instance: GC dead leases, read n_a from
+    the survivors, and water-fill (cached usage only — never blocks a launch on
+    the network). When usage is unknown (cold cache / balancer not running),
+    fall back to the least-loaded account so a launch still spreads and never
+    fails."""
+    leases = gc_leases(cfg)
+    load = account_load(leases)
+    stats = {a.name: offline_view(a, cfg, now) for a in accounts}
+    target = pick_shard_target(
+        accounts, stats, load, cfg.instances_per_account, now, cfg
+    )
+    if target is None:
+        target = min(accounts, key=lambda a: (load.get(a.name, 0), a.name))
+    return target
 
 
 # ------------------------------------------------------ blobs and state ---
@@ -819,6 +892,83 @@ def commit_swap(state: State, installed: str, blob_sha: str, now: float) -> None
     state["installed"] = installed
     state["blob_sha256"] = blob_sha
     state["last_swap_epoch"] = int(now)
+
+
+# --------------------------------------------------------------- leases ---
+# A sharded launch pins one instance to one account for its life. The lease
+# registry (pid -> account) is how the allocator knows n_a (live instances per
+# account) for water-filling, and how the tick reclaims an account when an
+# instance exits. Keyed by PID and GC'd by liveness — os.execvpe annihilates
+# the launcher's atexit handlers, so a lease can only be cleaned by checking
+# whether its PID is still alive, never by a release hook.
+
+
+def lease_file(cfg: Config) -> Path:
+    return cfg.cache / "leases.json"
+
+
+def read_leases(cfg: Config) -> dict[int, dict]:
+    """pid -> {account, started}. Malformed entries are dropped, never raise."""
+    raw = read_json(lease_file(cfg))
+    out: dict[int, dict] = {}
+    for k, v in raw.items():
+        try:
+            pid = int(k)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(v, dict) and isinstance(v.get("account"), str):
+            started = v.get("started")
+            out[pid] = {
+                "account": v["account"],
+                "started": int(started) if isinstance(started, (int, float)) else 0,
+            }
+    return out
+
+
+def write_leases(cfg: Config, leases: Mapping[int, dict]) -> None:
+    cfg.cache.mkdir(parents=True, exist_ok=True)
+    data = {str(pid): v for pid, v in leases.items()}
+    atomic_write(lease_file(cfg), json.dumps(data, indent=2).encode(), mode=0o644)
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether a PID names a live process. A permission error means it exists
+    but isn't ours (still alive); no-such-process means dead."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def gc_leases(cfg: Config, leases: dict[int, dict] | None = None) -> dict[int, dict]:
+    """Drop leases whose process has exited; persist only if something changed.
+    Returns the live set."""
+    leases = read_leases(cfg) if leases is None else leases
+    live = {pid: v for pid, v in leases.items() if pid_alive(pid)}
+    if len(live) != len(leases):
+        write_leases(cfg, live)
+    return live
+
+
+def account_load(leases: Mapping[int, dict]) -> dict[str, int]:
+    """Live instance count per account name — the n_a the allocator caps on."""
+    load: dict[str, int] = {}
+    for v in leases.values():
+        load[v["account"]] = load.get(v["account"], 0) + 1
+    return load
+
+
+def add_lease(cfg: Config, pid: int, account: str, now: float) -> None:
+    """Record a sharded instance's account, GC'ing dead leases first so the
+    file never grows without bound."""
+    leases = gc_leases(cfg)
+    leases[pid] = {"account": account, "started": int(now)}
+    write_leases(cfg, leases)
 
 
 # ------------------------------------------------- pool install / harvest ---
@@ -999,6 +1149,28 @@ def pull_due(cfg: Config, now: float) -> bool:
     return True
 
 
+def pool_session_age(cfg: Config, now: float) -> float | None:
+    """Seconds since the most recent turn written to the pool's transcripts,
+    or None when none is found. Claude Code appends to projects/**/*.jsonl
+    every turn, so the newest mtime tracks live session activity — the signal
+    the soft-swap guard uses to avoid swapping a warm prompt cache out for a
+    discretionary rebalance. Fail-soft: any error reads as 'no live session'."""
+    newest = 0.0
+    try:
+        for p in (cfg.pool / "projects").rglob("*.jsonl"):
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m > newest:
+                newest = m
+    except OSError:
+        return None
+    if newest == 0.0:
+        return None
+    return max(now - newest, 0.0)
+
+
 def tick(
     cfg: Config,
     now: float | None = None,
@@ -1022,6 +1194,7 @@ def tick(
             out("agent-balance: another tick holds the lock, skipping")
             return 0
 
+        gc_leases(cfg)  # reap leases of exited sharded instances
         state = read_state(cfg, now)
         state = harvest(cfg, accounts, state, now, out)
         installed = by_name(accounts, state["installed"])
@@ -1097,15 +1270,24 @@ def tick(
             assert installed is not None  # need would be "hard" otherwise
             out(f"agent-balance: {installed.name} at {five_now:.0f}% 5h{est} — ok")
             return 0
-        # min_gap damps optimization churn only — a 5h-wall roll ("roll")
-        # or a dead token ("hard") must never wait out a hysteresis gap
-        # behind a routine rebalance swap.
-        if need == "soft" and now - state["last_swap_epoch"] < cfg.min_gap:
-            out(
-                f"agent-balance: swap due ({reason}) but inside the "
-                f"{cfg.min_gap}s gap since the last one"
-            )
-            return 0
+        # min_gap and the cache-warmth hold damp optimization churn only — a
+        # 5h-wall roll ("roll") or a dead token ("hard") must never wait out a
+        # hysteresis gap behind a routine rebalance swap.
+        if need == "soft":
+            warm = pool_session_age(cfg, now)
+            if warm is not None and warm < cfg.cache_ttl:
+                out(
+                    f"agent-balance: rebalance due ({reason}) but a pool "
+                    f"session was active {warm:.0f}s ago — holding to keep its "
+                    "prompt cache warm"
+                )
+                return 0
+            if now - state["last_swap_epoch"] < cfg.min_gap:
+                out(
+                    f"agent-balance: swap due ({reason}) but inside the "
+                    f"{cfg.min_gap}s gap since the last one"
+                )
+                return 0
 
         if stats is None:
             stats = probe_fleet(accounts, cfg, now, fetcher)
@@ -1248,6 +1430,101 @@ def read_swap_tail(cfg: Config) -> list[str]:
     return []
 
 
+# ------------------------------------------------------------- metrics ---
+# Read-only instruments. They observe throttling and swap churn; they are
+# never control inputs (the balancer must not steer on its own transcripts).
+
+# The literal line Claude Code logs on per-minute THROUGHPUT throttling — the
+# "(not your usage limit)" is the API distinguishing it from the 5h/7d wall.
+THROTTLE_MARKER = "Server is temporarily limiting requests"
+
+
+def scan_throttle_events(
+    homes: list[Path], now: float, window: int = 3600, lookback: int = 86400
+) -> dict:
+    """Count per-minute throughput throttling in Claude Code transcripts.
+    Scans projects/**/*.jsonl under each account home for THROTTLE_MARKER
+    (distinct from the usage wall). Only files modified within `lookback` are
+    read; `recent` counts hits in files touched within `window`. Read-only and
+    fail-soft — transcripts are never modified, any error skips that file.
+    Bounded by lookback, and this is NOT a silent cap: the numbers are
+    explicitly 'within the last lookback/window seconds'."""
+    total = recent = files = 0
+    seen: set[Path] = set()
+    for home in homes:
+        proj = home / "projects"
+        try:
+            resolved = proj.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            paths = list(proj.rglob("*.jsonl"))
+        except OSError:
+            continue
+        for p in paths:
+            try:
+                mtime = p.stat().st_mtime
+                if now - mtime > lookback:
+                    continue
+                hits = p.read_text(errors="replace").count(THROTTLE_MARKER)
+            except OSError:
+                continue
+            if hits:
+                total += hits
+                files += 1
+                if now - mtime <= window:
+                    recent += hits
+    return {
+        "total": total,
+        "recent": recent,
+        "files": files,
+        "window_s": window,
+        "lookback_s": lookback,
+    }
+
+
+def swap_churn(cfg: Config, now: float, ttl: int, window: int = 86400) -> dict:
+    """From the swap log: swaps in the recent `window`, and how many landed
+    within `ttl` of the prior swap — a cache-warmth-bust proxy, since
+    back-to-back swaps re-bill a session's prefix. Fail-soft."""
+    epochs: list[int] = []
+    try:
+        for line in (cfg.cache / "swaps").read_text().splitlines():
+            try:
+                epochs.append(int(line.split()[0]))
+            except (ValueError, IndexError):
+                continue
+    except OSError:
+        return {"recent": 0, "warm_busts": 0, "ttl_s": ttl, "window_s": window}
+    epochs.sort()
+    recent = busts = 0
+    prev: int | None = None
+    for e in epochs:
+        if now - e <= window:
+            recent += 1
+            if prev is not None and 0 <= e - prev < ttl:
+                busts += 1
+        prev = e
+    return {"recent": recent, "warm_busts": busts, "ttl_s": ttl, "window_s": window}
+
+
+def gather_metrics(cfg: Config, accounts: list[Account], now: float) -> dict:
+    """The status `metrics` block: throughput-throttle events seen across the
+    managed accounts' transcripts, swap churn, and how recently a pool session
+    was active. Read-only; an instrument, never a control input. ('main' is
+    already in `accounts` as ~/.claude, and per-dir scans dedupe by resolved
+    path, so sharded sessions launched via agent-pick --use are covered;
+    sessions under a wholly custom CLAUDE_CONFIG_DIR are not.)"""
+    return {
+        "throttle_events": scan_throttle_events([a.home for a in accounts], now),
+        "swaps": swap_churn(cfg, now, cfg.cache_ttl),
+        "pool_session_age_s": pool_session_age(cfg, now),
+    }
+
+
 class StatusAccount(NamedTuple):
     name: str
     email: str
@@ -1267,6 +1544,7 @@ class StatusSnapshot:
     timer: str
     recent_swaps: list[str]
     claude_version: ClaudeVersion
+    metrics: dict = field(default_factory=dict)
 
 
 def gather_status(cfg: Config, *, network: bool) -> StatusSnapshot:
@@ -1294,6 +1572,29 @@ def gather_status(cfg: Config, *, network: bool) -> StatusSnapshot:
         timer=query_timer(),
         recent_swaps=read_swap_tail(cfg),
         claude_version=check_claude_version(),
+        metrics=gather_metrics(cfg, accounts, now),
+    )
+
+
+def format_metrics_line(metrics: dict, now: float) -> str:
+    """One compact 'throttle:' line for the status text, or '' when there is
+    nothing to report. Mirrors the JSON metrics block."""
+    te = metrics.get("throttle_events") or {}
+    sw = metrics.get("swaps") or {}
+    if not te and not sw:
+        return ""
+    win_m = int(te.get("window_s", 3600) // 60)
+    look_h = int(te.get("lookback_s", 86400) // 3600)
+    age = metrics.get("pool_session_age_s")
+    if isinstance(age, (int, float)):
+        sess = f"active {age / 60:.0f}m ago" if age >= 60 else "active now"
+    else:
+        sess = "idle"
+    return (
+        f"throttle: {te.get('recent', 0)} rate-limit hits in {win_m}m "
+        f"({te.get('total', 0)} in {look_h}h) · "
+        f"swaps {sw.get('recent', 0)} in 24h ({sw.get('warm_busts', 0)} "
+        f"cache-warm) · pool session {sess}"
     )
 
 
@@ -1333,6 +1634,10 @@ def render_status_text(snap: StatusSnapshot) -> None:
         print("recent swaps:")
         for line in snap.recent_swaps:
             print(f"  {line}")
+
+    line = format_metrics_line(snap.metrics, now)
+    if line:
+        print(line)
 
     # Appended LAST so a match/claude-absent run leaves the byte stream above
     # untouched; only a real major.minor mismatch prints this extra line.
@@ -1388,6 +1693,7 @@ def snapshot_to_json(snap: StatusSnapshot) -> dict:
             "installed": cv.installed,
             "mismatch": cv.mismatch,
         },
+        "metrics": snap.metrics,
     }
 
 
@@ -1516,7 +1822,17 @@ def cmd_uninstall(cfg: Config) -> int:
     return 0
 
 
-def cmd_launch(cfg: Config, args: list[str]) -> int:
+def claude_argv(args: list[str]) -> list[str]:
+    """argv for the wrapped claude. Drops one leading `--` that a shell wrapper
+    inserts to stop agent-balance from parsing claude's own flags — so
+    `claude -p …` (alias: `agent-balance launch --shard -- -p …`) reaches claude
+    as `claude -p …`, not as an unrecognized agent-balance option."""
+    return ["claude", *(args[1:] if args[:1] == ["--"] else args)]
+
+
+def cmd_launch(cfg: Config, args: list[str], shard: bool = False) -> int:
+    if shard:
+        return launch_sharded(cfg, args)
     tick(cfg, lock_wait=15)
     if not (cfg.pool / ".credentials.json").is_file():
         print(
@@ -1527,10 +1843,203 @@ def cmd_launch(cfg: Config, args: list[str]) -> int:
         return 1
     env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg.pool))
     try:
-        os.execvpe("claude", ["claude", *args], env)
+        os.execvpe("claude", claude_argv(args), env)
     except OSError as e:
         print(f"agent-balance: could not exec claude: {e}", file=sys.stderr)
         return 1
+
+
+def launch_sharded(cfg: Config, args: list[str]) -> int:
+    """Automatic sharding: assign THIS instance to the best account by the
+    water-filling policy, record a PID-keyed lease, and exec claude pinned to
+    that account's home dir for its whole life. Concurrent launches spread
+    across accounts (each its own per-minute bucket); each stays put (warm
+    cache, no churn). The lock serializes concurrent launches so two starting
+    at once see each other's leases and pick distinct accounts."""
+    now = time.time()
+    accounts = discover_accounts(cfg)
+    if not accounts:
+        print(
+            "agent-balance: no logged-in Anthropic accounts found "
+            f"(~/.claude or {cfg.root}/<name>/)",
+            file=sys.stderr,
+        )
+        return 1
+    with BalancerLock(cfg, wait=15):
+        target = choose_shard_account(cfg, accounts, now)
+        add_lease(cfg, os.getpid(), target.name, now)
+    print(
+        f"agent-balance: instance pinned to {target.name} ({target.email})",
+        file=sys.stderr,
+    )
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(target.home))
+    try:
+        os.execvpe("claude", claude_argv(args), env)
+    except OSError as e:
+        print(f"agent-balance: could not exec claude: {e}", file=sys.stderr)
+        return 1
+
+
+# --------------------------------------------------------------- bench ---
+# A throughput instrument: run identical claude calls at concurrency 1, then N
+# on one account, then N across distinct accounts, and report output tokens/s.
+# If N-on-one-account scales sublinearly while N-across-accounts scales ~N, the
+# per-minute bucket is per-account — i.e. sharding instances across accounts is
+# the throughput lever. Consumes REAL subscription tokens.
+
+# A throughput bench must measure GENERATION, not process startup — so the
+# default prompt forces a substantial, steady block of output tokens. A tiny
+# reply (4 tokens) would time claude's spawn + one round-trip and reveal
+# nothing about the per-minute output-token bucket.
+BENCH_PROMPT = (
+    "Write a detailed technical explanation, about 700 words, of how a modern "
+    "CPU executes an instruction from fetch through retirement — cover "
+    "pipelining, out-of-order execution, branch prediction, and caches. Use "
+    "flowing paragraphs, not lists. Aim for at least 700 words."
+)
+
+BenchRunner = Callable[[str, "Path | None"], tuple[int, bool]]
+
+
+class BenchResult(NamedTuple):
+    label: str
+    runs: int
+    ok: int
+    out_tokens: int
+    wall_s: float
+
+    @property
+    def tps(self) -> float:
+        return self.out_tokens / self.wall_s if self.wall_s > 0 else 0.0
+
+
+# The api-key vars (first three): set, any makes Claude Code take the api-key
+# path and 401 against subscription credentials (the OAuth gate flips off) — a
+# bench launched from inside a Claude Code session, where ANTHROPIC_API_KEY is
+# exported, would otherwise report every call as a failure. CLAUDE_EFFORT: an
+# interactive session may export a high effort (e.g. xhigh) that balloons each
+# bench call's thinking tokens, cost, and latency; drop it so the bench runs at
+# the account's own default and measures comparable output throughput.
+BENCH_ENV_DROP = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_EFFORT",
+)
+
+
+def bench_env(config_dir: Path | None, base: Mapping[str, str]) -> dict:
+    """Environment for a bench claude call: drop the api-key vars so the call
+    uses subscription OAuth, and pin CLAUDE_CONFIG_DIR to config_dir (a
+    distinct account) or leave it ambient (the pool) when None."""
+    env = {k: v for k, v in base.items() if k not in BENCH_ENV_DROP}
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env
+
+
+def claude_run(prompt: str, config_dir: Path | None) -> tuple[int, bool]:
+    """One real `claude --print --output-format json` call -> (output_tokens,
+    ok). config_dir pins CLAUDE_CONFIG_DIR (a distinct account); None uses the
+    ambient pool. Never raises; any failure reads as (0, False)."""
+    env = bench_env(config_dir, os.environ)
+    try:
+        r = subprocess.run(
+            ["claude", "--print", "--output-format", "json", prompt],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0, False
+    if r.returncode != 0:
+        return 0, False
+    try:
+        doc = json.loads(r.stdout)
+    except ValueError:
+        return 0, False
+    usage = doc.get("usage") if isinstance(doc, dict) else None
+    tok = (usage or {}).get("output_tokens")
+    return (int(tok) if isinstance(tok, (int, float)) else 0), True
+
+
+def run_bench_batch(
+    label: str,
+    prompt: str,
+    config_dirs: list[Path | None],
+    runner: BenchRunner,
+    clock: Callable[[], float] = time.time,
+) -> BenchResult:
+    """Run len(config_dirs) calls CONCURRENTLY, timing the whole batch (so tps
+    is aggregate goodput, not a per-call rate). runner/clock are injected so
+    the aggregation is testable without spending tokens."""
+    start = clock()
+    out_tokens = ok = 0
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(len(config_dirs), 1)
+    ) as ex:
+        for tok, good in ex.map(lambda d: runner(prompt, d), config_dirs):
+            out_tokens += tok
+            ok += 1 if good else 0
+    return BenchResult(label, len(config_dirs), ok, out_tokens, clock() - start)
+
+
+def cmd_bench(
+    cfg: Config,
+    prompt: str,
+    n: int,
+    account_names: list[str],
+    runner: BenchRunner = claude_run,
+    clock: Callable[[], float] = time.time,
+    out=print,
+) -> int:
+    accounts = discover_accounts(cfg)
+    out(
+        "agent-balance: benchmark makes REAL claude calls and spends "
+        "subscription tokens / quota."
+    )
+
+    def show(r: BenchResult) -> None:
+        miss = "" if r.ok == r.runs else f" ({r.runs - r.ok} failed)"
+        out(
+            f"  {r.label:<18} {r.out_tokens:>7} out tok  "
+            f"{r.wall_s:6.1f}s  {r.tps:7.1f} tok/s{miss}"
+        )
+
+    base = run_bench_batch("1x (baseline)", prompt, [None], runner, clock)
+    show(base)
+    same = run_bench_batch(f"{n}x same acct", prompt, [None] * n, runner, clock)
+    show(same)
+
+    dirs: list[Path | None] = []
+    for nm in account_names:
+        a = by_name(accounts, nm)
+        if a is None:
+            out(f"  (unknown account {nm!r}, skipping)")
+        else:
+            dirs.append(a.home)
+    dist = (
+        run_bench_batch(f"{len(dirs)}x distinct", prompt, dirs, runner, clock)
+        if dirs
+        else None
+    )
+    if dist is not None:
+        show(dist)
+
+    if base.tps > 0:
+        out(
+            f"  same-account scaling: {same.tps / base.tps:.2f}x "
+            f"(near 1x => one shared per-minute bucket; near {n}x => not "
+            "bucket-bound)"
+        )
+        if dist is not None:
+            out(
+                f"  distinct-account scaling: {dist.tps / base.tps:.2f}x "
+                f"across {dist.runs} accounts (near {dist.runs}x => sharding "
+                "instances multiplies throughput from this IP)"
+            )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1551,7 +2060,22 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("install", help="enable the systemd user timer")
     sub.add_parser("uninstall", help="remove the systemd user timer")
     launch = sub.add_parser("launch", help="tick, then exec claude on the pool")
+    launch.add_argument(
+        "--shard",
+        action="store_true",
+        help="pin this instance to the best account (auto-spread), not the pool",
+    )
     launch.add_argument("claude_args", nargs=argparse.REMAINDER)
+    bench_p = sub.add_parser(
+        "bench", help="measure 1-vs-N tokens/sec (spends real tokens)"
+    )
+    bench_p.add_argument("--prompt", default=BENCH_PROMPT)
+    bench_p.add_argument("--n", type=int, default=4)
+    bench_p.add_argument(
+        "--accounts",
+        default="",
+        help="comma-separated account names for the distinct-account run",
+    )
 
     ns = parser.parse_args(argv)
     cfg = make_config()
@@ -1583,7 +2107,10 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "uninstall":
         return cmd_uninstall(cfg)
     if ns.command == "launch":
-        return cmd_launch(cfg, ns.claude_args)
+        return cmd_launch(cfg, ns.claude_args, shard=getattr(ns, "shard", False))
+    if ns.command == "bench":
+        names = [s.strip() for s in ns.accounts.split(",") if s.strip()]
+        return cmd_bench(cfg, ns.prompt, ns.n, names)
     parser.error(f"unknown command {ns.command!r}")
 
 
