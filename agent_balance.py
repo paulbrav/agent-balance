@@ -75,12 +75,18 @@ WEEK = 7 * 86400
 CACHE_TTL = 300
 # Sharding's per-account concurrency cap k_a: how many live instances to
 # water-fill onto one account before spilling to the next — an estimate of its
-# per-minute bucket "knee" in instances. The bench showed 6 concurrent moderate
-# calls on one account do NOT throttle, so the real knee is >6; this default is
-# deliberately conservative (spreads a little early, costing some cache warmth,
-# but never saturates). Tune via AGENT_BALANCE_INSTANCES_PER_ACCOUNT; a later
-# AIMD loop can adjust it per-account from the observed 429 rate.
+# per-minute bucket "knee" in instances. The ramp bench measured the knee >10 on
+# one account, so this cold-start default is deliberately conservative (spreads
+# a little early, costing some cache warmth, but never saturates). Tune via
+# AGENT_BALANCE_INSTANCES_PER_ACCOUNT or per-account in caps.json (seeded from
+# the ramp bench / throttle ledger — the empirical knee, NOT a demand weight,
+# since there is no per-instance burn data; do not wire this to the .limited
+# probe flag, which is the wrong traffic stream).
 INSTANCES_PER_ACCOUNT = 6
+# Spill BEFORE the learned knee: the knee is only lower-bounded and crossing it
+# is a step penalty (429s), so the allocator spills at this fraction of it,
+# leaving headroom.
+SPILL_ALPHA = 0.75
 
 
 # ---------------------------------------------------------------- config ---
@@ -705,27 +711,71 @@ def pick_pull_target(
     return best.account, best.urgency, u_inst
 
 
+def caps_file(cfg: Config) -> Path:
+    return cfg.cache / "caps.json"
+
+
+def read_caps(cfg: Config) -> dict[str, int]:
+    """Per-account learned knee (instances) from caps.json — the empirical
+    throughput cap seeded by the ramp bench / throttle ledger. Malformed
+    entries are dropped, never raises."""
+    raw = read_json(caps_file(cfg))
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, (int, float)) and v >= 1:
+            out[k] = int(v)
+    return out
+
+
+def write_caps(cfg: Config, caps: Mapping[str, int]) -> None:
+    cfg.cache.mkdir(parents=True, exist_ok=True)
+    data = json.dumps({k: int(v) for k, v in caps.items()}, indent=2).encode()
+    atomic_write(caps_file(cfg), data, mode=0o644)
+
+
+def effective_caps(cfg: Config, accounts: list[Account]) -> dict[str, int]:
+    """The per-account spill cap the allocator water-fills against: the learned
+    knee from caps.json scaled by SPILL_ALPHA (conservative early spill, since
+    the knee is only lower-bounded), seeding any account with no learned cap at
+    cfg.instances_per_account. max(1, ...) guarantees at least one instance can
+    always land. The cap is the empirical knee, NOT a per-instance demand weight
+    (no per-instance burn data exists)."""
+    learned = read_caps(cfg)
+
+    def eff(name: str) -> int:
+        knee = learned.get(name, cfg.instances_per_account)
+        return max(1, int(SPILL_ALPHA * knee))
+
+    return {a.name: eff(a.name) for a in accounts}
+
+
 def pick_shard_target(
     accounts: list[Account],
     stats: Mapping[str, object],
     load: Mapping[str, int],
-    cap: int,
+    cap: Mapping[str, int],
     now: float,
     cfg: Config,
 ) -> Account | None:
     """The sharding allocator: WATER-FILLING. Among feasible accounts, prefer
     the highest-urgency one that still has per-minute bucket headroom (fewer
-    than `cap` live instances) — so load fills the most-urgent account up to
-    its knee, then spills to the next, burning weekly allowances in urgency
-    order while never saturating one bucket and spreading only as much as
-    needed (minimal cache fragmentation). When every feasible account is at
-    cap, fall back to the least-loaded one so an extra instance still lands on
-    the emptiest bucket. None when no account is feasible (the caller then
-    falls back to a blind least-loaded pick)."""
+    than its per-account `cap` live instances) — so load fills the most-urgent
+    account up to its knee, then spills to the next, burning weekly allowances
+    in urgency order while never saturating one bucket and spreading only as
+    much as needed (minimal cache fragmentation). When every feasible account is
+    at cap, fall back to the least-loaded one so an extra instance still lands on
+    the emptiest bucket. None when no account is feasible (the caller then falls
+    back to a blind least-loaded pick). An account missing from `cap` defaults to
+    cfg.instances_per_account, so an empty mapping reproduces uniform behavior."""
     feas = [c for c in candidates(accounts, stats, None, now, cfg) if c.feasible]
     if not feas:
         return None
-    under = [c for c in feas if load.get(c.account.name, 0) < cap]
+    under = [
+        c
+        for c in feas
+        if load.get(c.account.name, 0)
+        < cap.get(c.account.name, cfg.instances_per_account)
+    ]
     if under:
         return max(under, key=lambda c: rank(c, now)).account
     return min(
@@ -737,15 +787,15 @@ def choose_shard_account(
     cfg: Config, accounts: list[Account], now: float
 ) -> Account:
     """Pick the account for a launching instance: GC dead leases, read n_a from
-    the survivors, and water-fill (cached usage only — never blocks a launch on
-    the network). When usage is unknown (cold cache / balancer not running),
-    fall back to the least-loaded account so a launch still spreads and never
-    fails."""
+    the survivors, and water-fill against the per-account effective caps (cached
+    usage only — never blocks a launch on the network). When usage is unknown
+    (cold cache / balancer not running), fall back to the least-loaded account so
+    a launch still spreads and never fails."""
     leases = gc_leases(cfg)
     load = account_load(leases)
     stats = {a.name: offline_view(a, cfg, now) for a in accounts}
     target = pick_shard_target(
-        accounts, stats, load, cfg.instances_per_account, now, cfg
+        accounts, stats, load, effective_caps(cfg, accounts), now, cfg
     )
     if target is None:
         target = min(accounts, key=lambda a: (load.get(a.name, 0), a.name))
