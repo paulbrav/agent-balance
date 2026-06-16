@@ -2,8 +2,11 @@
 the status metrics line, and the bench aggregation (token-free, injected
 runner/clock)."""
 
+import itertools
+import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from conftest import NOW, add_account
 
@@ -206,3 +209,88 @@ def test_cmd_bench_skips_unknown_account(cfg):
     text = "\n".join(out)
     assert "unknown account 'ghost'" in text
     assert "distinct-account scaling" not in text
+
+
+# ----------------------------------------------------------- ramp bench ---
+
+
+def runner_throttles_at(knee_level, levels=ab.RAMP_LEVELS):
+    """A RampRunner that returns 'throttled' starting at the `knee_level` round.
+    run_ramp runs levels ascending and fully before the next, so the call
+    indices used at `knee_level` are exactly [prefix, prefix+knee_level)."""
+    prefix = sum(lv for lv in levels if lv < knee_level)
+    counter = itertools.count()
+
+    def runner(prompt, d):
+        return "throttled" if next(counter) >= prefix else "ok"
+
+    return runner
+
+
+def test_run_ramp_stops_at_first_throttle():
+    assert ab.run_ramp("p", None, ab.RAMP_LEVELS, runner_throttles_at(6)) == 6
+
+
+def test_run_ramp_none_when_never_throttles():
+    def runner(prompt, d):
+        return "ok"
+
+    assert ab.run_ramp("p", None, ab.RAMP_LEVELS, runner) is None
+
+
+def test_run_ramp_errors_do_not_stop():
+    counter = itertools.count()
+
+    def runner(prompt, d):
+        return "error" if next(counter) < 2 else "throttled"
+
+    # level 2 errors (don't stop), level 4 throttles -> knee 4
+    assert ab.run_ramp("p", None, (2, 4, 6), runner) == 4
+
+
+def _fake_run(returncode, doc):
+    def fake(*a, **k):
+        return SimpleNamespace(returncode=returncode, stdout=json.dumps(doc), stderr="")
+
+    return fake
+
+
+def test_claude_run_status_throttled(monkeypatch):
+    monkeypatch.setattr(ab.subprocess, "run", _fake_run(0, {"api_error_status": 429}))
+    assert ab.claude_run_status("p", None) == "throttled"
+
+
+def test_claude_run_status_ok(monkeypatch):
+    fake = _fake_run(0, {"is_error": False, "usage": {"output_tokens": 4}})
+    monkeypatch.setattr(ab.subprocess, "run", fake)
+    assert ab.claude_run_status("p", None) == "ok"
+
+
+def test_claude_run_status_error(monkeypatch):
+    monkeypatch.setattr(
+        ab.subprocess, "run", _fake_run(1, {"is_error": True, "api_error_status": 500})
+    )
+    assert ab.claude_run_status("p", None) == "error"
+
+
+def test_ramp_target_named_and_idle(cfg):
+    add_account(cfg, "alt1")
+    add_account(cfg, "alt2")
+    accts = ab.discover_accounts(cfg)
+    by_flag = ab.ramp_target(cfg, accts, ["alt1"], "alt2")
+    by_name = ab.ramp_target(cfg, accts, ["alt2"], None)
+    assert by_flag is not None and by_flag.name == "alt2"  # --ramp-account wins
+    assert by_name is not None and by_name.name == "alt2"  # first --accounts name
+    ab.write_leases(cfg, {os.getpid(): {"account": "alt1", "started": NOW}})
+    idle = ab.ramp_target(cfg, accts, [], None)
+    assert idle is not None and idle.name != "alt1"  # least-loaded fallback
+
+
+def test_cmd_bench_ramp_reports_knee(cfg):
+    add_account(cfg, "alt1")
+    out = []
+    ab.cmd_bench(
+        cfg, "p", 4, ["alt1"], ramp=True,
+        ramp_runner=runner_throttles_at(6), out=out.append,
+    )
+    assert "first throttled at 6" in "\n".join(out)

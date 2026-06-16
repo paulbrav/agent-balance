@@ -2000,6 +2000,9 @@ BENCH_PROMPT = (
 )
 
 BenchRunner = Callable[[str, "Path | None"], tuple[int, bool]]
+RunStatus = Literal["ok", "throttled", "error"]
+RampRunner = Callable[[str, "Path | None"], RunStatus]
+RAMP_LEVELS = (2, 4, 6, 8, 10)
 
 
 class BenchResult(NamedTuple):
@@ -2065,6 +2068,71 @@ def claude_run(prompt: str, config_dir: Path | None) -> tuple[int, bool]:
     return (int(tok) if isinstance(tok, (int, float)) else 0), True
 
 
+def claude_run_status(prompt: str, config_dir: Path | None) -> RunStatus:
+    """One real claude call classified 'ok' | 'throttled' (a 429 — the
+    per-minute knee) | 'error' (anything else), so the ramp stops at the true
+    throttle, not at an unrelated failure. Reads the JSON `api_error_status`
+    field. Never raises."""
+    env = bench_env(config_dir, os.environ)
+    try:
+        r = subprocess.run(
+            ["claude", "--print", "--output-format", "json", prompt],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "error"
+    try:
+        doc = json.loads(r.stdout)
+    except ValueError:
+        return "error"
+    status = doc.get("api_error_status") if isinstance(doc, dict) else None
+    if status in (429, "429"):
+        return "throttled"
+    if r.returncode != 0 or (isinstance(doc, dict) and doc.get("is_error")):
+        return "error"
+    return "ok"
+
+
+def run_ramp(
+    prompt: str,
+    config_dir: Path | None,
+    levels: tuple[int, ...],
+    runner: RampRunner,
+) -> int | None:
+    """Launch each level's calls CONCURRENTLY against ONE account, ascending,
+    and return the first level where ANY call is 'throttled' (the k_a knee
+    upper bound), or None if none throttled up to max(levels). Non-429 errors
+    do NOT stop the ramp — only a real 429 marks the knee."""
+    for level in levels:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(level, 1)
+        ) as ex:
+            results = list(ex.map(lambda d: runner(prompt, d), [config_dir] * level))
+        if any(s == "throttled" for s in results):
+            return level
+    return None
+
+
+def ramp_target(
+    cfg: Config,
+    accounts: list[Account],
+    account_names: list[str],
+    ramp_account: str | None,
+) -> Account | None:
+    """The account to ramp: --ramp-account, else the first --accounts name,
+    else the least-loaded (idle) account. None when nothing resolves."""
+    name = ramp_account or (account_names[0] if account_names else None)
+    if name:
+        return by_name(accounts, name)
+    if not accounts:
+        return None
+    load = account_load(gc_leases(cfg))
+    return min(accounts, key=lambda a: (load.get(a.name, 0), a.name))
+
+
 def run_bench_batch(
     label: str,
     prompt: str,
@@ -2094,12 +2162,34 @@ def cmd_bench(
     runner: BenchRunner = claude_run,
     clock: Callable[[], float] = time.time,
     out=print,
+    ramp: bool = False,
+    ramp_account: str | None = None,
+    ramp_levels: tuple[int, ...] = RAMP_LEVELS,
+    ramp_runner: RampRunner = claude_run_status,
 ) -> int:
     accounts = discover_accounts(cfg)
     out(
         "agent-balance: benchmark makes REAL claude calls and spends "
         "subscription tokens / quota."
     )
+
+    if ramp:
+        target = ramp_target(cfg, accounts, account_names, ramp_account)
+        if target is None:
+            out("  (no account available to ramp)")
+            return 1
+        knee = run_ramp(prompt, target.home, ramp_levels, ramp_runner)
+        if knee is None:
+            out(
+                f"  ramp: {target.name} — no throttle up to "
+                f"{max(ramp_levels)} concurrent (knee > {max(ramp_levels)})"
+            )
+        else:
+            out(
+                f"  ramp: {target.name} first throttled at {knee} concurrent "
+                f"— k_a knee <= {knee} (seed caps.json below this)"
+            )
+        return 0
 
     def show(r: BenchResult) -> None:
         miss = "" if r.ok == r.runs else f" ({r.runs - r.ok} failed)"
@@ -2177,6 +2267,13 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="comma-separated account names for the distinct-account run",
     )
+    bench_p.add_argument(
+        "--ramp",
+        action="store_true",
+        help="ramp 2..10 concurrent on ONE account to find its 429 knee "
+        "(spends real tokens, burns that account's 5h window)",
+    )
+    bench_p.add_argument("--ramp-account", default=None, dest="ramp_account")
 
     ns = parser.parse_args(argv)
     cfg = make_config()
@@ -2211,7 +2308,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_launch(cfg, ns.claude_args, shard=getattr(ns, "shard", False))
     if ns.command == "bench":
         names = [s.strip() for s in ns.accounts.split(",") if s.strip()]
-        return cmd_bench(cfg, ns.prompt, ns.n, names)
+        return cmd_bench(
+            cfg, ns.prompt, ns.n, names,
+            ramp=ns.ramp, ramp_account=ns.ramp_account,
+        )
     parser.error(f"unknown command {ns.command!r}")
 
 
