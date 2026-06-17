@@ -22,36 +22,109 @@ def write_jsonl(path: Path, text: str, mtime: float) -> None:
 # ----------------------------------------------------- scan_throttle_events ---
 
 
-def test_scan_counts_marker(tmp_path):
+def _iso(epoch):
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(epoch, UTC).isoformat()
+
+
+def throttle_line(epoch, status=429):
+    """A GENUINE Claude Code per-minute-throttle apiError envelope at `epoch`."""
+    return json.dumps(
+        {
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "apiErrorStatus": status,
+            "timestamp": _iso(epoch),
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "API Error: " + ab.THROTTLE_MARKER
+                        + " (not your usage limit) · Rate limited",
+                    }
+                ]
+            },
+        }
+    )
+
+
+def quote_line(epoch):
+    """A line that merely MENTIONS the marker (a tool result / summary / audit)
+    — same text, but not an apiError envelope. Must never be counted."""
+    return json.dumps(
+        {
+            "type": "user",
+            "timestamp": _iso(epoch),
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": "grep found 40x: " + ab.THROTTLE_MARKER,
+                    }
+                ]
+            },
+        }
+    )
+
+
+def test_scan_counts_genuine_429(tmp_path):
     home = tmp_path / "acct"
-    line = '{"err":"... ' + ab.THROTTLE_MARKER + ' (not your usage limit) ..."}\n'
-    write_jsonl(home / "projects" / "p" / "s.jsonl", '{"x":1}\n' + line, NOW - 100)
+    body = '{"type":"assistant"}\n' + throttle_line(NOW - 100) + "\n"
+    write_jsonl(home / "projects" / "p" / "s.jsonl", body, NOW - 100)
     r = ab.scan_throttle_events([home], NOW)
     assert r["total"] == 1
     assert r["recent"] == 1
     assert r["files"] == 1
 
 
+def test_scan_ignores_quoted_marker(tmp_path):
+    # The false positive that lit the tray badge: a transcript that QUOTES the
+    # throttle text (a summary, an audit, this very session) is not a throttle.
+    home = tmp_path / "acct"
+    write_jsonl(home / "projects" / "q.jsonl", quote_line(NOW - 100) + "\n", NOW - 100)
+    r = ab.scan_throttle_events([home], NOW)
+    assert r["total"] == 0 and r["recent"] == 0 and r["files"] == 0
+
+
+def test_scan_recent_uses_line_timestamp_not_file_mtime(tmp_path):
+    # A 429 from 2h ago in a session STILL being appended (fresh mtime) must not
+    # read as 'recent' — recent is gated on the event's own timestamp.
+    home = tmp_path / "acct"
+    write_jsonl(
+        home / "projects" / "s.jsonl", throttle_line(NOW - 7200) + "\n", NOW - 60
+    )
+    r = ab.scan_throttle_events([home], NOW)
+    assert r["total"] == 1  # within the 24h lookback
+    assert r["recent"] == 0  # but NOT within the 1h window (by line ts)
+
+
 def test_scan_recent_is_subset_of_total(tmp_path):
     home = tmp_path / "acct"
-    mark = ab.THROTTLE_MARKER + "\n"
-    write_jsonl(home / "projects" / "old.jsonl", mark, NOW - 7200)
-    write_jsonl(home / "projects" / "new.jsonl", mark, NOW - 100)
+    write_jsonl(
+        home / "projects" / "old.jsonl", throttle_line(NOW - 7200) + "\n", NOW - 7200
+    )
+    write_jsonl(
+        home / "projects" / "new.jsonl", throttle_line(NOW - 100) + "\n", NOW - 100
+    )
     r = ab.scan_throttle_events([home], NOW)  # window 3600, lookback 86400
     assert r["total"] == 2  # both within lookback
-    assert r["recent"] == 1  # only the fresh file within window
+    assert r["recent"] == 1  # only the fresh event within window
 
 
 def test_scan_skips_beyond_lookback(tmp_path):
     home = tmp_path / "acct"
-    old = home / "projects" / "ancient.jsonl"
-    write_jsonl(old, ab.THROTTLE_MARKER + "\n", NOW - 200000)
+    write_jsonl(
+        home / "projects" / "ancient.jsonl",
+        throttle_line(NOW - 200000) + "\n",
+        NOW - 200000,
+    )
     assert ab.scan_throttle_events([home], NOW)["total"] == 0
 
 
 def test_scan_dedupes_by_resolved_path(tmp_path):
     home = tmp_path / "acct"
-    write_jsonl(home / "projects" / "s.jsonl", ab.THROTTLE_MARKER + "\n", NOW - 50)
+    write_jsonl(home / "projects" / "s.jsonl", throttle_line(NOW - 50) + "\n", NOW - 50)
     assert ab.scan_throttle_events([home, home], NOW)["total"] == 1
 
 
@@ -294,3 +367,25 @@ def test_cmd_bench_ramp_reports_knee(cfg):
         ramp_runner=runner_throttles_at(6), out=out.append,
     )
     assert "first throttled at 6" in "\n".join(out)
+
+
+# ----------------------------------------------------------- tray health ---
+
+
+def test_tray_health_throttled():
+    h = ab.tray_health({"throttle_events": {"recent": 5}})
+    assert h == {"state": "throttled", "label": "throttled"}
+
+
+def test_tray_health_ok_when_no_recent_429s():
+    assert ab.tray_health({"throttle_events": {"recent": 0}}) == {
+        "state": "ok",
+        "label": "",
+    }
+
+
+def test_tray_health_failsoft_on_missing_or_malformed():
+    assert ab.tray_health({})["state"] == "ok"
+    assert ab.tray_health({"throttle_events": None})["state"] == "ok"
+    assert ab.tray_health({"throttle_events": {}})["state"] == "ok"
+    assert ab.tray_health({"throttle_events": {"recent": "x"}})["state"] == "ok"

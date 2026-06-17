@@ -93,9 +93,13 @@ def test_status_json_shape(cfg, capsys, monkeypatch):
         "timer",
         "recent_swaps",
         "claude_version",
+        "health",
     }
     assert doc["version"] == ab.VERSION
     assert doc["root"] == str(cfg.root)
+    # The tray's sole indicator signal: snapshot_to_json must emit it (the tray
+    # fails open, so a dropped key would silently go dark). No 429s here -> ok.
+    assert doc["health"] == {"state": "ok", "label": ""}
 
     by = {a["name"]: a for a in doc["accounts"]}
     # INVARIANT: usage XOR status — exactly one is non-null, per account.
