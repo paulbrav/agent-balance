@@ -9,29 +9,59 @@ from conftest import D4, H2, NOW, add_account, install_pool, run_tick, usage
 import agent_balance as ab
 
 
-def write_marker(home, mtime, count=1):
-    f = home / "projects" / "p" / "s.jsonl"
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text((ab.THROTTLE_MARKER + " (not your usage limit)\n") * count)
-    os.utime(f, (mtime, mtime))
-
-
 def _iso(epoch):
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(epoch, UTC).isoformat()
 
 
-def append_turn(home, mtime, *, throttle=False, epoch=None):
-    """Append ONE real-shaped transcript line (a 429 or a normal turn) and
-    advance the file mtime — models Claude Code's append-only transcripts."""
+def throttle_line(epoch):
+    """A GENUINE Claude Code 429 apiError envelope stamped at `epoch` — the real
+    shape (isApiErrorMessage + apiErrorStatus), not a bare marker string, so it
+    is counted by _throttle_event while a mere quote of the text is not."""
+    return json.dumps(
+        {
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "apiErrorStatus": 429,
+            "timestamp": _iso(epoch),
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "API Error: " + ab.THROTTLE_MARKER
+                        + " (not your usage limit)",
+                    }
+                ]
+            },
+        }
+    )
+
+
+def write_marker(home, mtime, count=1):
     f = home / "projects" / "p" / "s.jsonl"
     f.parent.mkdir(parents=True, exist_ok=True)
-    text = ab.THROTTLE_MARKER + " (not your usage limit)" if throttle else "ok"
-    line = json.dumps(
-        {"type": "assistant", "timestamp": _iso(mtime if epoch is None else epoch),
-         "message": {"content": [{"type": "text", "text": text}]}}
-    )
+    f.write_text((throttle_line(mtime) + "\n") * count)
+    os.utime(f, (mtime, mtime))
+
+
+def append_turn(home, mtime, *, throttle=False, epoch=None):
+    """Append ONE real-shaped transcript line (a genuine 429 apiError or a
+    normal turn) and advance the file mtime — models Claude Code's append-only
+    transcripts."""
+    f = home / "projects" / "p" / "s.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    ep = mtime if epoch is None else epoch
+    if throttle:
+        line = throttle_line(ep)
+    else:
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": _iso(ep),
+                "message": {"content": [{"type": "text", "text": "ok"}]},
+            }
+        )
     with f.open("a") as fh:
         fh.write(line + "\n")
     os.utime(f, (mtime, mtime))
@@ -121,6 +151,33 @@ def test_ledger_ignores_limited_flag(cfg):
     seed_seen(cfg, "alt1", NOW - 1000)
     ab.stamp_set(cfg.cache / "alt1.limited", NOW - 50)  # the WRONG stream
     ab.record_throttles(cfg, home, "alt1", 1, NOW)  # no transcript marker
+    assert ledger_rows(cfg) == []
+
+
+def test_ledger_ignores_quoted_marker(cfg):
+    # A transcript that QUOTES the marker (a workflow summary / audit / this
+    # session) is not a real apiError and must not be folded into the ledger —
+    # the same false-positive fix as the tray scan.
+    home = add_account(cfg, "alt1")
+    seed_seen(cfg, "alt1", NOW - 1000)
+    f = home / "projects" / "p" / "s.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": _iso(NOW - 50),
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "content": "saw " + ab.THROTTLE_MARKER}
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+    os.utime(f, (NOW - 50, NOW - 50))
+    assert ab.record_throttles(cfg, home, "alt1", 1, NOW) == 0
     assert ledger_rows(cfg) == []
 
 

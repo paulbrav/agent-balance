@@ -1515,16 +1515,58 @@ def _walk_jsonl(root: Path):
                     continue
 
 
+def _throttle_event(line: str) -> tuple[bool, float | None]:
+    """Classify one transcript line for throttle accounting, returning
+    (is_throttle, epoch).
+
+    `is_throttle` is True ONLY for a genuine per-minute throttle: Claude Code's
+    own apiError envelope — `isApiErrorMessage: true`, an `apiErrorStatus` that
+    is 429 (or absent on older logs), carrying THROTTLE_MARKER. It is False for
+    any line that merely QUOTES the message — a tool result, a workflow
+    <failures> summary, a status report, this very audit — which carry the
+    marker text but none of the apiError fields. `epoch` is the line's own ISO
+    `timestamp` as a Unix epoch when present, else None. Fail-soft: a non-JSON
+    or non-dict line is (False, None).
+
+    This is what separates 'the server refused a request' from 'a transcript
+    that talks about the server refusing requests' — a distinction a raw
+    substring count cannot make. Without it, a session that investigates
+    throttling (or a long-lived session that hit one 429 hours ago and is kept
+    warm by later turns) reads as actively throttled."""
+    if THROTTLE_MARKER not in line:
+        return (False, None)
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return (False, None)
+    if not isinstance(obj, dict) or obj.get("isApiErrorMessage") is not True:
+        return (False, None)
+    status = obj.get("apiErrorStatus")
+    if status is not None and status != 429 and str(status) != "429":
+        return (False, None)
+    ts = obj.get("timestamp")
+    if not isinstance(ts, str):
+        return (True, None)
+    try:
+        return (True, datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return (True, None)
+
+
 def scan_throttle_events(
     homes: list[Path], now: float, window: int = 3600, lookback: int = 86400
 ) -> dict:
-    """Count per-minute throughput throttling in Claude Code transcripts.
-    Scans projects/**/*.jsonl under each account home for THROTTLE_MARKER
-    (distinct from the usage wall). Only files modified within `lookback` are
-    read; `recent` counts hits in files touched within `window`. Read-only and
-    fail-soft — transcripts are never modified, any error skips that file.
-    Bounded by lookback, and this is NOT a silent cap: the numbers are
-    explicitly 'within the last lookback/window seconds'."""
+    """Count GENUINE per-minute throttle 429s in Claude Code transcripts.
+    Scans projects/**/*.jsonl under each account home and counts only Claude
+    Code's own apiError envelope (see _throttle_event), NOT every line that
+    mentions the marker — so a transcript that quotes the error (a summary, an
+    audit, this session) does not register. Each event is bucketed by its OWN
+    timestamp: `total` counts events within `lookback`, `recent` within
+    `window`; an event with no parseable timestamp falls back to the file mtime.
+    Files untouched for longer than `lookback` are skipped unread. Read-only and
+    fail-soft — transcripts are never modified, any error skips that file. NOT a
+    silent cap: the numbers are explicitly 'within the last lookback/window
+    seconds'."""
     total = recent = files = 0
     seen: set[Path] = set()
     for home in homes:
@@ -1540,14 +1582,25 @@ def scan_throttle_events(
             try:
                 if now - mtime > lookback:
                     continue
-                hits = p.read_text(errors="replace").count(THROTTLE_MARKER)
+                text = p.read_text(errors="replace")
             except OSError:
                 continue
-            if hits:
-                total += hits
+            if THROTTLE_MARKER not in text:
+                continue
+            file_hit = False
+            for line in text.splitlines():
+                ok, epoch = _throttle_event(line)
+                if not ok:
+                    continue
+                age = now - (epoch if epoch is not None else mtime)
+                if age > lookback:
+                    continue
+                total += 1
+                file_hit = True
+                if age <= window:
+                    recent += 1
+            if file_hit:
                 files += 1
-                if now - mtime <= window:
-                    recent += hits
     return {
         "total": total,
         "recent": recent,
@@ -1557,36 +1610,18 @@ def scan_throttle_events(
     }
 
 
-def _line_epoch(line: str) -> float | None:
-    """The transcript line's own `timestamp` (ISO-8601) as an epoch, or None
-    when the line isn't a JSON object with a parseable timestamp. Fail-soft —
-    a non-JSON line or a substring-only marker yields None (no per-line gate)."""
-    try:
-        obj = json.loads(line)
-    except ValueError:
-        return None
-    if not isinstance(obj, dict):
-        return None
-    ts = obj.get("timestamp")
-    if not isinstance(ts, str):
-        return None
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
 def scan_new_throttles(
     home: Path, since: float, now: float, lookback: int = 86400
 ) -> int:
-    """Count THROTTLE_MARKER hits in one account's transcripts that are NEW
-    since the last scan. Files older than `lookback` are skipped by mtime; then
-    each marker LINE is counted only if its own `timestamp` is in (since, now].
-    Per-line gating is what makes the ledger idempotent against APPEND-ONLY
-    transcripts: a later normal turn advances file mtime but does not re-count
-    the old 429, because the 429 line's timestamp is <= since. A marker line
-    without a parseable timestamp falls back to the file-mtime gate (counted,
-    since the file as a whole is newer than since). Read-only and fail-soft."""
+    """Count GENUINE 429 throttle events in one account's transcripts that are
+    NEW since the last scan. Files older than `lookback` are skipped by mtime;
+    then each line is classified by _throttle_event (Claude Code's apiError
+    envelope — lines that merely quote the marker are ignored) and counted only
+    if its own `timestamp` is in (since, now]. Per-line gating keeps the ledger
+    idempotent against APPEND-ONLY transcripts: a later normal turn advances
+    file mtime but does not re-count the old 429, whose timestamp is <= since. A
+    genuine event without a parseable timestamp falls back to the file-mtime
+    gate. Read-only and fail-soft."""
     hits = 0
     for p, mtime in _walk_jsonl(home / "projects"):
         try:
@@ -1595,10 +1630,12 @@ def scan_new_throttles(
             text = p.read_text(errors="replace")
         except OSError:
             continue
+        if THROTTLE_MARKER not in text:
+            continue
         for line in text.splitlines():
-            if THROTTLE_MARKER not in line:
+            ok, ep = _throttle_event(line)
+            if not ok:
                 continue
-            ep = _line_epoch(line)
             if ep is None or since < ep <= now:
                 hits += 1
     return hits
