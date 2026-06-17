@@ -2,10 +2,10 @@
 # agent-balance-tray — the agent-pick --list table as a tray dropdown.
 #
 # An AppIndicator (GNOME: needs the ubuntu-appindicators/AppIndicator
-# extension) whose label shows the installed account and its 5h usage, and
-# whose dropdown renders every account's 5h/7d windows as colored bars.
-# Probes share agent-balance's 45s cache, so the tray adds no API load on
-# top of the balancer's tick.
+# extension) that stays quiet when the fleet is healthy and raises an attention
+# badge ("throttled") when you're being rate-limited; its dropdown renders every
+# account's 5h/7d windows as colored bars. Probes share agent-balance's 45s
+# cache, so the tray adds no API load on top of the balancer's tick.
 #
 # Uses the SYSTEM python (PyGObject + libayatana typelibs are distro
 # packages): on Debian/Ubuntu, `apt install python3-gi gir1.2-ayatanaappindicator3-0.1`.
@@ -89,7 +89,6 @@ class Row(NamedTuple):
     email: str
     usage: dict | None  # {"five","seven","r5","r7","asof"} or None (word row)
     status: str | None  # status word, or None when usage is present
-    installed: bool
 
 
 @dataclass
@@ -97,7 +96,7 @@ class Snapshot:
     """One worker-thread collection pass, handed to the GTK thread."""
 
     now: float = 0.0
-    installed_name: str = ""
+    health: dict = field(default_factory=dict)  # {"state","label"} from status
     rows: list[Row] = field(default_factory=list)
     error: str | None = None  # collection blew up; rows are empty
 
@@ -130,12 +129,12 @@ def collect() -> Snapshot:
     except ValueError as e:
         return Snapshot(error=f"bad status JSON: {e}")
     rows = [
-        Row(a["name"], a["email"], a.get("usage"), a.get("status"), a["installed"])
+        Row(a["name"], a["email"], a.get("usage"), a.get("status"))
         for a in doc.get("accounts", [])
     ]
     return Snapshot(
         now=doc["now"],
-        installed_name=(doc.get("installed") or {}).get("name", ""),
+        health=doc.get("health") or {},
         rows=rows,
     )
 
@@ -148,6 +147,8 @@ class Tray:
             AppIndicator.IndicatorCategory.APPLICATION_STATUS,
         )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        # Shown (themed distinctively) whenever status is flipped to ATTENTION.
+        self.indicator.set_attention_icon_full("dialog-warning-symbolic", "throttled")
         self.indicator.set_menu(self.build_menu(Snapshot()))
         self.refresh()
         # Honor a tuned cadence without importing agent_balance: read the same
@@ -170,15 +171,18 @@ class Tray:
         GLib.idle_add(self._update, snap)
 
     def _update(self, snap: Snapshot):
-        if snap.error is None:  # on a hiccup, keep the last good label
-            installed = next((r for r in snap.rows if r.installed), None)
-            if installed and installed.usage is not None:
-                # Identity is the email, not the directory name; the local
-                # part keeps the label short.
-                who = (installed.email or installed.name).split("@")[0]
-                self.indicator.set_label(f" {who} {installed.usage['five']:.0f}%", "")
-            else:
-                self.indicator.set_label(f" {snap.installed_name}", "")
+        if snap.error is None:  # on a hiccup, keep the last good label/icon
+            # One health signal: quiet (just the icon) when fine, an ATTENTION
+            # badge + short word when throttled. The old installed-account 5h%
+            # is gone — it described the pool, which sharding bypasses.
+            state = snap.health.get("state", "ok")
+            label = snap.health.get("label", "")
+            self.indicator.set_status(
+                AppIndicator.IndicatorStatus.ATTENTION
+                if state != "ok"
+                else AppIndicator.IndicatorStatus.ACTIVE
+            )
+            self.indicator.set_label(f" {label}" if label else "", "")
         self.indicator.set_menu(self.build_menu(snap))
         return False
 
@@ -217,8 +221,6 @@ class Tray:
                     f"{esc(who):<32} "
                     f"<span foreground='{DIM}'>{esc(str(row.status))}</span>"
                 )
-            if row.installed:
-                cells += f" <span foreground='{GREEN}'>◀ installed</span>"
             menu.append(self.row_item(cells))
         if snap.error is not None:
             menu.append(

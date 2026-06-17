@@ -1846,6 +1846,19 @@ def render_status_text(snap: StatusSnapshot) -> None:
         print(warning)
 
 
+def tray_health(metrics: Mapping[str, object]) -> dict:
+    """A single glanceable fleet-health state for the tray indicator, replacing
+    the now-meaningless installed-account percentage: 'throttled' when 429s were
+    seen in the recent (1h) window, else 'ok'. The tray renders this as the
+    indicator's attention state + a short label; wall proximity stays in the
+    per-account quota bars of its menu, so the indicator carries one signal."""
+    te = metrics.get("throttle_events")
+    recent = te.get("recent", 0) if isinstance(te, dict) else 0
+    if isinstance(recent, (int, float)) and recent > 0:
+        return {"state": "throttled", "label": "throttled"}
+    return {"state": "ok", "label": ""}
+
+
 def snapshot_to_json(snap: StatusSnapshot) -> dict:
     """The sole author of the `status --json` document shape (mirrors
     usage_to_cache's single-source pattern). Numbers stay raw so the contract
@@ -1894,6 +1907,7 @@ def snapshot_to_json(snap: StatusSnapshot) -> dict:
             "mismatch": cv.mismatch,
         },
         "metrics": snap.metrics,
+        "health": tray_health(snap.metrics),
     }
 
 

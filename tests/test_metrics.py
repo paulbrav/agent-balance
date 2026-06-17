@@ -294,3 +294,25 @@ def test_cmd_bench_ramp_reports_knee(cfg):
         ramp_runner=runner_throttles_at(6), out=out.append,
     )
     assert "first throttled at 6" in "\n".join(out)
+
+
+# ----------------------------------------------------------- tray health ---
+
+
+def test_tray_health_throttled():
+    h = ab.tray_health({"throttle_events": {"recent": 5}})
+    assert h == {"state": "throttled", "label": "throttled"}
+
+
+def test_tray_health_ok_when_no_recent_429s():
+    assert ab.tray_health({"throttle_events": {"recent": 0}}) == {
+        "state": "ok",
+        "label": "",
+    }
+
+
+def test_tray_health_failsoft_on_missing_or_malformed():
+    assert ab.tray_health({})["state"] == "ok"
+    assert ab.tray_health({"throttle_events": None})["state"] == "ok"
+    assert ab.tray_health({"throttle_events": {}})["state"] == "ok"
+    assert ab.tray_health({"throttle_events": {"recent": "x"}})["state"] == "ok"
